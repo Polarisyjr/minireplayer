@@ -62,6 +62,9 @@ minireplay record --config run.json --out source-run/ --bundle bundle/
 minireplay replay --config run.json --bundle bundle/ --out replay-0/
 minireplay replay --config run.json --bundle bundle/ --out replay-1/
 minireplay report --bundle bundle/ --run replay-0/ --run replay-1/ --source source-run/
+minireplay plot-comparison \
+  --bundle bundle/ --source source-run/ \
+  --run replay-0/ --run replay-1/ --out comparison/
 ```
 
 `record` runs the sweep with `-s none`, which attaches no step1/step2 profiler; the
@@ -84,6 +87,12 @@ Because this changes the workload, it is part of bundle identity.
 `report` compares repeated replays and flags metrics whose spread is worth a look. It
 does not fail a run for being slow, and it does not attribute variance automatically
 — compilation, package fetches and network access move these numbers legitimately.
+
+`plot-comparison` validates the fixed operation counts and per-actor closed work,
+then emits SVG/PNG batch wallclock and full causal-lane timelines plus per-lane
+JSON/CSV. Repeat `--run` for any number of replays. Dispatch wrappers are omitted;
+`browse_url` remains a composite scope rather than a filled tool, and recording
+cutoff tails are shown only as transparent, hatched evidence.
 
 ## Checks
 

@@ -13,6 +13,7 @@ TERMINAL_SCHEMA = "minireplay.terminal/v1"
 METRICS_SCHEMA = "minireplay.metrics/v1"
 TIMELINE_SCHEMA = "minireplay.timeline/v1"
 REPORT_SCHEMA = "minireplay.report/v1"
+COMPARISON_SCHEMA = "minireplay.replay-comparison/v1"
 RESULT_CONTRACT_SCHEMA = "native-agent-replay.result-contract/v2"
 LANE_RECORD_EVENT_SCHEMA = "minireplay.lane-record-event/v1"
 

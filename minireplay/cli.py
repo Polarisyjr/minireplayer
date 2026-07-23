@@ -43,6 +43,30 @@ def _parser() -> argparse.ArgumentParser:
     report.add_argument("--source", type=Path)
     report.add_argument("--out", type=Path)
 
+    comparison = commands.add_parser(
+        "plot-comparison",
+        help="plot one recording and one or more validated replays",
+    )
+    comparison.add_argument("--bundle", type=Path, required=True)
+    comparison.add_argument("--source", type=Path, required=True)
+    comparison.add_argument(
+        "--run",
+        type=Path,
+        action="append",
+        required=True,
+        help="replay directory; repeat for every replay to compare",
+    )
+    comparison.add_argument("--out", type=Path, required=True)
+    comparison.add_argument("--prefix", help="output filename stem (derived by default)")
+    comparison.add_argument("--label", help="workload label shown in figure titles")
+    comparison.add_argument(
+        "--format",
+        dest="formats",
+        action="append",
+        choices=("svg", "png"),
+        help="output format; repeat to select both (default: svg and png)",
+    )
+
     validate = commands.add_parser("validate", help="validate a bundle")
     validate.add_argument("--bundle", type=Path, required=True)
 
@@ -108,6 +132,22 @@ def _run(arguments: argparse.Namespace) -> int:
             atomic_write_json(arguments.out, report)
         print(json.dumps(report, sort_keys=True, indent=2))
         return 0 if report["valid"] else 1
+
+    if arguments.command == "plot-comparison":
+        # Keep matplotlib initialization out of record/replay command startup.
+        from .comparison_plot import render_comparison
+
+        result = render_comparison(
+            bundle_dir=arguments.bundle,
+            source_dir=arguments.source,
+            run_dirs=list(arguments.run),
+            output_dir=arguments.out,
+            prefix=arguments.prefix,
+            label=arguments.label,
+            formats=arguments.formats or ("svg", "png"),
+        )
+        print(json.dumps(result, sort_keys=True, indent=2))
+        return 0
 
     if arguments.command == "validate":
         bundle = load_bundle(arguments.bundle)
