@@ -392,6 +392,12 @@ def _validate_cutoff_tails(value: dict[str, Any]) -> None:
                 isinstance(entry.get("actor_id"), str) and bool(entry["actor_id"]),
                 f"cutoff tails: {section} entry has no actor",
             )
+            causal_lane = entry.get("causal_lane")
+            require(
+                causal_lane is None
+                or (isinstance(causal_lane, str) and bool(causal_lane)),
+                f"cutoff tails: {section} entry has an invalid causal_lane",
+            )
 
 
 def _require_cutoff_tails_disjoint(

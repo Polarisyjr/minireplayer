@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from minireplay.boundary import BoundaryLedger
-from minireplay.errors import MismatchError
+from minireplay.errors import WorkloadComplete
 from minireplay.llm_store import LLMStore
 from minireplay.util import sha256_json
 from tests.support import llm, make_bundle
@@ -71,9 +71,13 @@ def test_llm_tail_is_diagnostic_not_claimable(tmp_path: Path) -> None:
         ),
     )
 
-    assert store._claim(identity(), BODY, "chat.completions")["attempt_id"] == "llm-0"
+    expected = store._claim(identity(), BODY, "chat.completions")
+    assert expected["attempt_id"] == "llm-0"
+    assert store.expected_complete() is False
+    store._write_replay_attempt(expected, identity(), 100, 200)
+    store._delivered.add("llm-0")
     assert store.expected_complete() is True
-    with pytest.raises(MismatchError, match="unexpected LLM request"):
+    with pytest.raises(WorkloadComplete, match="recorded window closed"):
         store._claim(identity(), BODY, "chat.completions")
 
 

@@ -95,6 +95,40 @@ def test_load_rejects_a_dangling_tool(tmp_path: Path) -> None:
         build(tmp_path, stage_dir)
 
 
+def test_standalone_composite_primitive_needs_no_outer_dispatch(tmp_path: Path) -> None:
+    primitive = tool(
+        dispatch_id=None,
+        causal_lane="model-call:browse-0",
+        name="browser_action",
+    )
+    stage_dir = stage(
+        tmp_path,
+        **{
+            "dispatches.jsonl": [],
+            "tools.jsonl": [primitive],
+            "spans.jsonl": [span(primitive["span_id"])],
+        },
+    )
+
+    bundle = build(tmp_path, stage_dir)
+
+    assert bundle.dispatches == []
+    assert bundle.tools[0]["dispatch_id"] is None
+    assert bundle.tools[0]["causal_lane"] == "model-call:browse-0"
+
+
+def test_standalone_primitive_requires_a_causal_lane(tmp_path: Path) -> None:
+    stage_dir = stage(
+        tmp_path,
+        **{
+            "dispatches.jsonl": [],
+            "tools.jsonl": [tool(dispatch_id=None)],
+        },
+    )
+    with pytest.raises(ValidationError, match="requires a causal_lane"):
+        build(tmp_path, stage_dir)
+
+
 def test_load_rejects_a_tampered_argument_digest(tmp_path: Path) -> None:
     """The claim path trusts the digest, so the digest is verified here instead."""
 

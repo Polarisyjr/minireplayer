@@ -13,6 +13,7 @@ from typing import Any
 
 from minireplay.observation import recorded_output_result_contract
 from minireplay.sdk import (
+    composite_scope,
     current_context,
     last_llm_attempt_id,
     llm_scope,
@@ -30,6 +31,12 @@ from .result_replay import encode_framework_output, restore_framework_output
 from .state import state
 
 _TASK_SUBMISSIONS = itertools.count()
+_COMPOSITE_TOOL_IMPLEMENTATIONS = frozenset(
+    {
+        "camel.toolkits.browser_toolkit.AsyncBrowserToolkit.browse_url",
+        "camel.toolkits.browser_toolkit.BrowserToolkit.browse_url",
+    }
+)
 
 # owl's own launcher tags every model it builds with the role that selected the
 # endpoint (`make_model` in run_gaia_workforce_vllm_flex.py). That attribute is the
@@ -189,6 +196,15 @@ def _cover_invoked_tool(tool: Any) -> tuple[str, str]:
     return name, implementation
 
 
+def _is_composite_tool(tool: Any) -> bool:
+    return _tool_implementation(tool) in _COMPOSITE_TOOL_IMPLEMENTATIONS
+
+
+def _requested_tool(agent: Any, name: str) -> Any | None:
+    tools = getattr(agent, "_internal_tools", {})
+    return tools.get(name) if isinstance(tools, dict) else None
+
+
 def _tool_timeout(tool: Any) -> float | None:
     owner = getattr(getattr(tool, "func", None), "__self__", None)
     value = getattr(owner, "timeout", None)
@@ -224,7 +240,13 @@ def _primitive_tool(name: str, implementation: str, arguments: dict[str, Any], i
 
 
 async def _primitive_tool_async(
-    name: str, implementation: str, arguments: dict[str, Any], invoke
+    name: str,
+    implementation: str,
+    arguments: dict[str, Any],
+    invoke,
+    *,
+    result_encoder=encode_framework_output,
+    result_replayer=restore_framework_output,
 ):
     state().cover("implementation", implementation, tool_name=name)
     return await run_tool_async(
@@ -232,9 +254,9 @@ async def _primitive_tool_async(
         implementation=implementation,
         arguments=arguments,
         invoke=invoke,
-        result_encoder=encode_framework_output,
+        result_encoder=result_encoder,
         result_contract=recorded_output_result_contract(),
-        result_replayer=restore_framework_output,
+        result_replayer=result_replayer,
     )
 
 
@@ -270,11 +292,86 @@ def _browser_action_factory(original):
     """
 
     async def wrapped(self, action_code, *args, **kwargs):
+        # A video-question action contains its own VLM request and model-free
+        # extraction primitives.  It is orchestration for the same reason as
+        # browse_url, so do not add an outer browser_action slot around them.
+        from camel.toolkits.browser_toolkit import (
+            MODEL_BACKED_BROWSER_ACTIONS,
+            extract_function_name,
+            normalize_browser_action_code,
+        )
+
+        normalized = normalize_browser_action_code(action_code)
+        if extract_function_name(normalized) in MODEL_BACKED_BROWSER_ACTIONS:
+            return await original(self, action_code, *args, **kwargs)
         return await _primitive_tool_async(
             "browser_action",
             "camel.toolkits.browser_toolkit.AsyncBaseBrowser.async_act",
-            {"action_code": jsonable(action_code)},
+            {"action_code": jsonable(normalized)},
             lambda: original(self, action_code, *args, **kwargs),
+        )
+
+    return wrapped
+
+
+def _browser_init_factory(original):
+    async def wrapped(self, *args, **kwargs):
+        if current_context()["composite_lane"] is None:
+            return await original(self, *args, **kwargs)
+        return await _primitive_tool_async(
+            "browser_open",
+            "camel.toolkits.browser_toolkit.AsyncBaseBrowser.async_init",
+            {"headless": bool(self.headless)},
+            lambda: original(self, *args, **kwargs),
+        )
+
+    return wrapped
+
+
+def _browser_visit_factory(original):
+    async def wrapped(self, url, *args, **kwargs):
+        context = current_context()
+        # visit_page is also one possible browser_action implementation.  In
+        # that case the enclosing action is already the primitive boundary.
+        if context["composite_lane"] is None or context["tool_call_id"] is not None:
+            return await original(self, url, *args, **kwargs)
+        return await _primitive_tool_async(
+            "browser_visit_page",
+            "camel.toolkits.browser_toolkit.AsyncBaseBrowser.async_visit_page",
+            {
+                "url": jsonable(url),
+                "timeout": jsonable(kwargs.get("timeout", 30000)),
+                "max_retries": jsonable(kwargs.get("max_retries", 2)),
+            },
+            lambda: original(self, url, *args, **kwargs),
+        )
+
+    return wrapped
+
+
+def _browser_observe_result(value: Any) -> dict[str, Any]:
+    # The PIL image is native input to the following VLM call and is not a
+    # framework observation we can safely substitute.  Record the durable path
+    # identity while replay executes the native screenshot operation again.
+    path = value[1] if isinstance(value, tuple) and len(value) == 2 else None
+    return {"output": {"screenshot_path": jsonable(path)}}
+
+
+def _keep_native_browser_observation(native: Any, _recorded: Any) -> Any:
+    return native
+
+
+def _browser_observe_factory(original):
+    async def wrapped(self, save_image=False, *args, **kwargs):
+        if current_context()["composite_lane"] is None:
+            return await original(self, save_image, *args, **kwargs)
+        return await _primitive_tool_async(
+            "browser_observe",
+            "camel.toolkits.browser_toolkit.AsyncBaseBrowser.async_get_som_screenshot",
+            {"save_image": bool(save_image)},
+            lambda: original(self, save_image, *args, **kwargs),
+            result_encoder=_browser_observe_result,
+            result_replayer=_keep_native_browser_observation,
         )
 
     return wrapped
@@ -294,6 +391,8 @@ def _browser_close_factory(original):
 
 def _call_factory(original):
     def wrapped(self, *args, **kwargs):
+        if _is_composite_tool(self):
+            return original(self, *args, **kwargs)
         name, implementation = _cover_invoked_tool(self)
         return run_tool(
             name=name,
@@ -311,6 +410,8 @@ def _call_factory(original):
 
 def _async_call_factory(original):
     async def wrapped(self, *args, **kwargs):
+        if _is_composite_tool(self):
+            return await original(self, *args, **kwargs)
         name, implementation = _cover_invoked_tool(self)
         return await run_tool_async(
             name=name,
@@ -333,8 +434,16 @@ def _execute_tool_factory(original):
         trigger = last_llm_attempt_id()
         if not isinstance(trigger, str) or not trigger:
             raise RuntimeError("Owl tool dispatch has no generating LLM attempt")
+        name = str(tool_call_request.tool_name)
+        tool = _requested_tool(self, name)
+        if tool is not None and _is_composite_tool(tool):
+            with composite_scope(
+                name=name,
+                model_call_id=str(tool_call_request.tool_call_id),
+            ):
+                return original(self, tool_call_request)
         return run_dispatch(
-            name=str(tool_call_request.tool_name),
+            name=name,
             arguments=jsonable(tool_call_request.args),
             parser_identity="camel.agents._types.ToolCallRequest",
             dispatcher_identity=dispatcher_identity,
@@ -355,8 +464,16 @@ def _aexecute_tool_factory(original):
         trigger = last_llm_attempt_id()
         if not isinstance(trigger, str) or not trigger:
             raise RuntimeError("Owl async tool dispatch has no generating LLM attempt")
+        name = str(tool_call_request.tool_name)
+        tool = _requested_tool(self, name)
+        if tool is not None and _is_composite_tool(tool):
+            with composite_scope(
+                name=name,
+                model_call_id=str(tool_call_request.tool_call_id),
+            ):
+                return await original(self, tool_call_request)
         return await run_dispatch_async(
-            name=str(tool_call_request.tool_name),
+            name=name,
             arguments=jsonable(tool_call_request.args),
             parser_identity="camel.agents._types.ToolCallRequest",
             dispatcher_identity=dispatcher_identity,
@@ -374,6 +491,7 @@ def _record_chat_registry(agent: Any, phase: str) -> None:
     inventory: list[dict[str, Any]] = []
     for name, tool in sorted(agent._internal_tools.items()):
         implementation = _tool_implementation(tool)
+        composite = _is_composite_tool(tool)
         registry_identity = f"camel.FunctionTool:{implementation}"
         state().cover("implementation", implementation, tool_name=str(name))
         state().cover("registry", registry_identity, tool_name=str(name), native_id=str(name))
@@ -383,7 +501,8 @@ def _record_chat_registry(agent: Any, phase: str) -> None:
                 "native_id": str(name),
                 "registry_identity": registry_identity,
                 "implementation_identity": implementation,
-                "dispatch_supported": True,
+                "dispatch_supported": not composite,
+                "composite_scope": composite,
             }
         )
     for name, schema in sorted(agent._external_tool_schemas.items()):
@@ -551,7 +670,7 @@ def install() -> None:
     importlib.import_module("camel.toolkits")
     from camel.agents.chat_agent import ChatAgent
     from camel.models.base_model import BaseModelBackend
-    from camel.toolkits.browser_toolkit import AsyncBrowserToolkit
+    from camel.toolkits.browser_toolkit import AsyncBaseBrowser, AsyncBrowserToolkit
     from camel.toolkits.function_tool import FunctionTool
     from utils.enhanced_workforce import OwlWorkforce
     from utils.gaia import GAIABenchmark
@@ -594,12 +713,20 @@ def install() -> None:
     from camel.utils import replay_capture
 
     patch_method(replay_capture, "run_tool_primitive", _run_tool_primitive_factory)
+    patch_method(AsyncBaseBrowser, "async_init", _browser_init_factory)
+    patch_method(AsyncBaseBrowser, "async_visit_page", _browser_visit_factory)
+    patch_method(
+        AsyncBaseBrowser,
+        "async_get_som_screenshot",
+        _browser_observe_factory,
+    )
     patch_method(AsyncBrowserToolkit, "async_act", _browser_action_factory)
     patch_method(AsyncBrowserToolkit, "_close_browser_primitive", _browser_close_factory)
     state().mark("owl-tool-primitive")
     state().mark("owl-browser-primitive")
 
     state().mark("owl-function-tool")
+    state().mark("owl-composite-scope")
     state().mark("owl-dispatch-ledger")
     state().mark("owl-live-browser-approximate")
     state().mark("owl-model-routing")

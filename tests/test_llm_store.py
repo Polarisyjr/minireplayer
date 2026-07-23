@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from minireplay.errors import MismatchError
+from minireplay.errors import MismatchError, WorkloadComplete
 from minireplay.llm_store import LLMStore, RequestIdentity, request_shape
 from minireplay.util import sha256_json
 from tests.support import llm, make_bundle
@@ -42,6 +42,21 @@ def test_rejects_an_extra_request(tmp_path: Path) -> None:
     store_._claim(identity(), BODY, "chat.completions")
     with pytest.raises(MismatchError, match="unexpected LLM request"):
         store_._claim(identity(), BODY, "chat.completions")
+
+
+def test_holds_a_completed_lane_while_a_sibling_lane_finishes(tmp_path: Path) -> None:
+    records = [
+        llm(attempt_id="llm-agent", role="agent"),
+        llm(attempt_id="llm-grader", role="grader"),
+    ]
+    store_ = store(tmp_path, records)
+    agent = store_._claim(identity(role="agent"), BODY, "chat.completions")
+    store_._write_replay_attempt(agent, identity(role="agent"), 100, 200)
+    store_._delivered.add("llm-agent")
+
+    assert store_.expected_complete() is False
+    with pytest.raises(WorkloadComplete, match="recorded window closed"):
+        store_._claim(identity(role="agent"), BODY, "chat.completions")
 
 
 def test_rejects_api_drift(tmp_path: Path) -> None:
@@ -97,9 +112,18 @@ def test_expected_complete_requires_every_attempt(tmp_path: Path) -> None:
         tmp_path, [llm(attempt_id="llm-0", sequence=0), llm(attempt_id="llm-1", sequence=1)]
     )
     assert store_.expected_complete() is False
-    store_._claim(identity(), BODY, "chat.completions")
+    first = store_._claim(identity(), BODY, "chat.completions")
     assert store_.expected_complete() is False
-    store_._claim(identity(), BODY, "chat.completions")
+    second = store_._claim(identity(), BODY, "chat.completions")
+    # Claiming every queue slot is not completion: the engine/audit and the
+    # framework-visible HTTP response can still be in flight.
+    assert store_.expected_complete() is False
+    store_._write_replay_attempt(first, identity(), 100, 200)
+    store_._delivered.add("llm-0")
+    assert store_.expected_complete() is False
+    store_._write_replay_attempt(second, identity(), 200, 300)
+    assert store_.expected_complete() is False
+    store_._delivered.add("llm-1")
     assert store_.expected_complete() is True
 
 

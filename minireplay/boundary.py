@@ -139,13 +139,32 @@ class BoundaryLedger:
         self.active: dict[str, Reservation] = {}
         self._expected: dict[tuple, list[dict[str, Any]]] = {}
         self._cursor: dict[tuple, int] = {}
+        self._cutoff_expected: dict[tuple, list[dict[str, Any]]] = {}
+        self._cutoff_cursor: dict[tuple, int] = {}
+        self._cutoff_intercepted: set[tuple[str, str]] = set()
         self._completed: set[tuple[str, str]] = set()
+        self._delivered: set[tuple[str, str]] = set()
         self._lane_of_record: dict[str, str | None] = {}
 
         self._truncated: set[tuple[str, str]] = set()
         self._truncated_elapsed: dict[tuple[str, str], int] = {}
         self._truncated_started: dict[tuple[str, str], int] = {}
         self.source_cutoff_at_ns: int | None = None
+        self._causal_lanes_enabled = bundle is None or (
+            any(
+                isinstance(record.get("causal_lane"), str)
+                and bool(record["causal_lane"])
+                for kind in ("dispatch", "tool")
+                for record in (bundle.records(kind) if bundle is not None else [])
+            )
+            or any(
+                isinstance(record.get("causal_lane"), str)
+                and bool(record["causal_lane"])
+                for record in (
+                    bundle.cutoff_tails.get("operations", []) if bundle is not None else []
+                )
+            )
+        )
 
         if bundle is not None:
             self._load_expected(bundle)
@@ -153,38 +172,97 @@ class BoundaryLedger:
     # ---- expectation loading -------------------------------------------------
 
     def _load_expected(self, bundle: Any) -> None:
+        # Dispatches establish the causal lane inherited by their native tool.
+        # Load them first even though bundle.records() is otherwise kind-agnostic.
         for kind in ("dispatch", "tool", "grader", "artifact"):
             for record in bundle.records(kind):
                 lane = self._record_lane(kind, record)
+                if kind == "dispatch":
+                    self._lane_of_record[str(record["dispatch_id"])] = lane
                 key = (kind, str(record["actor_id"]), lane)
                 self._expected.setdefault(key, []).append(record)
-        # Cutoff tails remain in the bundle as source diagnostics but are excluded
-        # from replay. Only the closed causal prefix is claimable.
+
+        # A tail is source-only evidence, not claimable native work.  It still has
+        # to be recognized at entry: one concurrent branch may have remained open
+        # at cutoff while sibling lanes produced later closed records.  Matching it
+        # here lets the HTTP handler hold only that branch before native execution.
+        for record in bundle.cutoff_tails.get("operations", []):
+            kind = str(record.get("kind"))
+            if kind not in _ID_FIELD:
+                continue
+            lane = self._record_lane(kind, record)
+            if kind == "dispatch":
+                self._lane_of_record[str(record.get("record_id"))] = lane
+            key = (kind, str(record["actor_id"]), lane)
+            self._cutoff_expected.setdefault(key, []).append(record)
+
         for queue in self._expected.values():
+            queue.sort(key=_issue_order)
+        for queue in self._cutoff_expected.values():
             queue.sort(key=_issue_order)
 
     def _record_lane(self, kind: str, record: dict[str, Any]) -> str | None:
-        """CORAL runs several concurrent OpenCode sessions inside one actor.
+        """Resolve the framework-independent causal lane for an operation."""
 
-        Those sessions are independent causal chains, so they get their own queues;
-        ordering between them is natural concurrency and must not be constrained.
-        Every other adapter keeps one queue per actor.
-        """
-
-        if self.adapter != "coral" or kind not in {"dispatch", "tool"}:
+        if kind not in {"dispatch", "tool"}:
             return None
+        if not self._causal_lanes_enabled:
+            # Compatibility for bundles written before causal_lane was persisted.
+            # CORAL was the only adapter with lane semantics in that format.
+            if self.adapter != "coral":
+                return None
+            if kind == "dispatch":
+                session = record.get("session_id")
+                return str(session) if isinstance(session, str) and session else None
+            return self._lane_of_record.get(str(record.get("dispatch_id")))
+        explicit = record.get("causal_lane")
+        if isinstance(explicit, str) and explicit:
+            return explicit
         if kind == "dispatch":
-            session = record.get("session_id")
-            return str(session) if isinstance(session, str) and session else None
-        return self._lane_of_record.get(str(record["dispatch_id"]))
+            return self._dispatch_lane(record)
+        return self._lane_of_record.get(str(record.get("dispatch_id")))
 
     def _payload_lane(self, kind: str, payload: dict[str, Any]) -> str | None:
-        if self.adapter != "coral" or kind not in {"dispatch", "tool"}:
+        if kind not in {"dispatch", "tool"}:
             return None
+        if not self._causal_lanes_enabled:
+            if self.adapter != "coral":
+                return None
+            if kind == "dispatch":
+                session = payload.get("session_id")
+                return str(session) if isinstance(session, str) and session else None
+            return self._lane_of_record.get(str(payload.get("dispatch_id")))
+        explicit = payload.get("causal_lane")
+        if isinstance(explicit, str) and explicit:
+            return explicit
         if kind == "dispatch":
-            session = payload.get("session_id")
-            return str(session) if isinstance(session, str) and session else None
+            return self._dispatch_lane(payload)
         return self._lane_of_record.get(str(payload.get("dispatch_id")))
+
+    @staticmethod
+    def _dispatch_lane(value: dict[str, Any]) -> str | None:
+        """Derive a stable lane when an adapter does not pass one explicitly.
+
+        A model tool-call is one causal branch.  Its ID is replayed as part of the
+        recorded response, while the trigger attempt is resolved to its source ID
+        before this function runs.  Prefixing it with the native session preserves
+        independent nested sessions without adapter-specific conditions.
+        """
+
+        origin = value.get("origin")
+        if isinstance(origin, dict):
+            model_call = origin.get("model_call_id")
+            if isinstance(model_call, str) and model_call:
+                return f"model-call:{model_call}"
+        session = value.get("session_id")
+        session_id = str(session) if isinstance(session, str) and session else None
+        if isinstance(origin, dict):
+            trigger = origin.get("trigger_id")
+            if isinstance(trigger, str) and trigger:
+                return f"session:{session_id or '-'}|trigger:{trigger}"
+        if session_id is not None:
+            return f"session:{session_id}"
+        return None
 
     # ---- claim ---------------------------------------------------------------
 
@@ -193,30 +271,72 @@ class BoundaryLedger:
         key = (kind, actor_id, lane)
         queue = self._expected.get(key, [])
         cursor = self._cursor.get(key, 0)
-        if cursor >= len(queue):
-            whole_run_complete = self.run_complete is not None and self.run_complete()
-            actor_complete = self.actor_complete is not None and self.actor_complete(actor_id)
-            if whole_run_complete or actor_complete:
-                raise WorkloadComplete(
-                    f"native {kind} for actor {actor_id} arrived after the recorded window closed"
-                )
-            raise MismatchError(
-                f"unexpected native {kind} for actor {actor_id}"
-                f"{f' lane {lane}' if lane else ''}: "
-                f"the recording holds {len(queue)} and all are consumed"
-            )
-        expected = queue[cursor]
+        cutoff_queue = self._cutoff_expected.get(key, [])
+        cutoff_cursor = self._cutoff_cursor.get(key, 0)
+
+        observed = None
         if not self.fast_claim:
             observed = claim_identity(kind, self._claimable(kind, payload))
-            recorded = claim_identity(kind, expected)
-            if observed != recorded:
-                raise MismatchError(
-                    f"native {kind} invocation drift for actor {actor_id} "
-                    f"lane {lane!r} at position {cursor}: "
-                    f"expected={recorded!r} actual={observed!r}"
+
+        if cursor < len(queue):
+            # Closed fixed work always has priority over diagnostic cutoff
+            # evidence in the same causal lane. The first closed operation and
+            # the later open tail may legitimately have identical arguments
+            # (for example, retrying the same browser fill action). Matching the
+            # tail first would stop at the earlier closed occurrence.
+            expected = queue[cursor]
+            if not self.fast_claim:
+                assert observed is not None
+                recorded = claim_identity(kind, expected)
+                if observed != recorded:
+                    raise MismatchError(
+                        f"native {kind} invocation drift for actor {actor_id} "
+                        f"lane {lane!r} at position {cursor}: "
+                        f"expected={recorded!r} actual={observed!r}"
+                    )
+            self._cursor[key] = cursor + 1
+            return expected
+
+        # Evidence-only means "do not replay the tail", not "pretend the source
+        # never entered it". Once this lane's closed prefix is consumed, hold a
+        # matching tail before native entry while sibling causal lanes finish.
+        if cutoff_cursor < len(cutoff_queue):
+            cutoff = cutoff_queue[cutoff_cursor]
+            cutoff_matches = self.fast_claim
+            if observed is not None:
+                cutoff_matches = observed == claim_identity(kind, cutoff)
+            if cutoff_matches:
+                self._cutoff_cursor[key] = cutoff_cursor + 1
+                self._cutoff_intercepted.add(self._identity_of(kind, cutoff))
+                raise WorkloadComplete(
+                    f"native {kind} for actor {actor_id} entered a source cutoff tail"
                 )
-        self._cursor[key] = cursor + 1
-        return expected
+            assert observed is not None
+            raise MismatchError(
+                f"native {kind} cutoff-tail drift for actor {actor_id} "
+                f"lane {lane!r}: expected={claim_identity(kind, cutoff)!r} "
+                f"actual={observed!r}"
+            )
+
+        whole_run_complete = self.run_complete is not None and self.run_complete()
+        actor_complete = self.actor_complete is not None and self.actor_complete(actor_id)
+        # Causal lanes are independent fixed-work prefixes. A completed,
+        # non-empty lane may reach the source boundary while sibling lanes
+        # are still replaying; hold its next operation before native entry.
+        # Empty lanes and lanes with an unacknowledged final operation remain
+        # hard failures so this cannot hide an early duplicate.
+        lane_complete = bool(queue) and all(
+            self._identity_of(kind, record) in self._delivered for record in queue
+        )
+        if whole_run_complete or actor_complete or lane_complete:
+            raise WorkloadComplete(
+                f"native {kind} for actor {actor_id} arrived after the recorded window closed"
+            )
+        raise MismatchError(
+            f"unexpected native {kind} for actor {actor_id}"
+            f"{f' lane {lane}' if lane else ''}: "
+            f"the recording holds {len(queue)} and all are consumed"
+        )
 
     def _claimable(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         value = dict(payload)
@@ -311,7 +431,9 @@ class BoundaryLedger:
 
     # ---- complete ------------------------------------------------------------
 
-    def complete(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def complete(
+        self, payload: dict[str, Any], *, defer_delivery: bool = False
+    ) -> dict[str, Any]:
         reservation_id = payload.get("reservation_id")
         require(isinstance(reservation_id, str), "completion reservation_id is required")
         reservation = self.active.pop(reservation_id, None)
@@ -341,7 +463,15 @@ class BoundaryLedger:
         append_jsonl(self.stage_dir / LEDGER_FILES[reservation.kind], record)
         self._write_span(reservation, record, ended)
         self._completed.add(identity)
+        if not defer_delivery:
+            self._delivered.add(identity)
         return self._completion_response(reservation, dropped=False)
+
+    def mark_delivered(self, identity: tuple[str, str]) -> None:
+        """Publish completion only after the boundary response reaches its socket."""
+
+        require(identity in self._completed, "cannot deliver an incomplete operation")
+        self._delivered.add(identity)
 
     def _completion_response(self, reservation: Reservation, *, dropped: bool) -> dict[str, Any]:
         response: dict[str, Any] = {"valid": True}
@@ -397,6 +527,7 @@ class BoundaryLedger:
         arguments = self._logical(native_arguments)
         return {
             **common,
+            "causal_lane": reservation.lane,
             "session_id": request.get("session_id"),
             "parser_identity": request.get("parser_identity"),
             "dispatcher_identity": request.get("dispatcher_identity"),
@@ -434,6 +565,7 @@ class BoundaryLedger:
             exception_raised = True
         return {
             **common,
+            "causal_lane": reservation.lane,
             "dispatch_id": request.get("dispatch_id"),
             "name": request.get("name"),
             "implementation": request.get("implementation"),
@@ -567,6 +699,14 @@ class BoundaryLedger:
                     "span_id": reservation.span_id,
                     "actor_id": reservation.actor_id,
                     "lane": reservation.lane,
+                    "causal_lane": reservation.lane,
+                    "session_id": reservation.request.get("session_id"),
+                    "origin": reservation.request.get("origin"),
+                    **(
+                        {"dispatch_id": reservation.request.get("dispatch_id")}
+                        if reservation.kind == "tool"
+                        else {}
+                    ),
                     "name": reservation.request.get("name"),
                     "implementation": reservation.request.get("implementation"),
                     "grader_kind": reservation.request.get("grader_kind"),
@@ -617,7 +757,7 @@ class BoundaryLedger:
                 identity = self._identity_of(key[0], record)
                 if identity in self._truncated:
                     continue
-                if identity not in self._completed:
+                if identity not in self._delivered:
                     return False
         now = monotonic_ns()
         for identity, required in self._truncated_elapsed.items():
@@ -646,7 +786,7 @@ class BoundaryLedger:
                     required = self._truncated_elapsed[identity]
                     if started is None or (now - started) < required:
                         return False
-                elif identity not in self._completed:
+                elif identity not in self._delivered:
                     return False
         return True
 
@@ -672,11 +812,15 @@ class BoundaryLedger:
         for key, queue in self._expected.items():
             for record in queue:
                 identity = self._identity_of(key[0], record)
-                if identity in self._truncated or identity in self._completed:
+                if identity in self._truncated or identity in self._delivered:
                     continue
                 missing.append(f"{identity[0]}:{identity[1]}")
         return {
             "missing": sorted(missing),
+            "evidence_not_delivered": sorted(
+                f"{kind}:{record_id}"
+                for kind, record_id in self._completed - self._delivered
+            ),
             "unexpected_active": sorted(
                 f"{r.kind}:{r.record_id}"
                 for r in self.active.values()
@@ -719,9 +863,14 @@ class BoundaryLedger:
     async def handle_complete(self, request: web.Request) -> web.Response:
         self._authorize(request)
         payload = await request.json()
+        reservation_id = payload.get("reservation_id")
+        reservation = self.active.get(reservation_id)
+        delivery_identity = (
+            (reservation.kind, reservation.record_id) if reservation is not None else None
+        )
         self.active_writes += 1
         try:
-            result = self.complete(payload)
+            result = self.complete(payload, defer_delivery=True)
         except MismatchError as exc:
             return self._fail(exc, phase="complete")
         finally:
@@ -729,7 +878,12 @@ class BoundaryLedger:
         if result.pop("_hold_for_cutoff", False):
             # Never returns. See _hold_truncated.
             await asyncio.Event().wait()
-        return web.json_response(result)
+        response = web.json_response(result)
+        await response.prepare(request)
+        await response.write_eof()
+        if delivery_identity is not None and delivery_identity in self._completed:
+            self.mark_delivered(delivery_identity)
+        return response
 
     async def handle_status(self, request: web.Request) -> web.Response:
         self._authorize(request)

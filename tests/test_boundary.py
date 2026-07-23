@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from minireplay.boundary import BoundaryLedger
-from minireplay.errors import MismatchError
+from minireplay.errors import MismatchError, WorkloadComplete
 from tests.support import dispatch, make_bundle, tool
 
 
@@ -105,6 +105,169 @@ def test_coral_sessions_are_separate_lanes(tmp_path: Path) -> None:
     assert led.start(start_dispatch("s/root/child", "child"))["record_id"] == "d-child"
 
 
+def test_model_tool_calls_are_generic_causal_lanes(tmp_path: Path) -> None:
+    """Concurrent branches are independent for every adapter, not only CORAL."""
+
+    first = dispatch(dispatch_id="d-first", arguments={"n": "first"}, execution_call_id=None)
+    first["origin"]["model_call_id"] = "call-first"
+    first["causal_lane"] = "model-call:call-first"
+    second = dispatch(dispatch_id="d-second", arguments={"n": "second"}, execution_call_id=None)
+    second["origin"]["model_call_id"] = "call-second"
+    second["causal_lane"] = "model-call:call-second"
+    led = ledger(tmp_path, make_bundle(dispatches=[first, second], tools=[]), adapter="owl")
+
+    def payload(name: str) -> dict:
+        return {
+            "kind": "dispatch",
+            "actor_id": "actor-0",
+            "session_id": "actor-0",
+            "process_role": "agent",
+            "started_at_ns": 100,
+            "parser_identity": "parser",
+            "dispatcher_identity": "dispatcher",
+            "native_call_id": f"call-{name}",
+            "name": "shell",
+            "arguments": {"n": name},
+            "origin": {
+                "kind": "llm_structured",
+                "trigger_id": "llm-0",
+                "model_call_id": f"call-{name}",
+            },
+        }
+
+    # The source began first before second; the runtime may issue sibling branches
+    # in the opposite order without turning natural concurrency into drift.
+    assert led.start(payload("second"))["record_id"] == "d-second"
+    assert led.start(payload("first"))["record_id"] == "d-first"
+
+
+def test_interleaved_cutoff_lane_is_held_before_native_entry(tmp_path: Path) -> None:
+    closed = dispatch(
+        dispatch_id="d-closed",
+        arguments={"command": "closed"},
+        execution_call_id=None,
+        started=400,
+        ended=500,
+    )
+    closed["origin"]["model_call_id"] = "call-closed"
+    closed["causal_lane"] = "model-call:call-closed"
+    tail = dispatch(
+        dispatch_id="d-tail",
+        arguments={"command": "tail"},
+        execution_call_id=None,
+        started=200,
+        ended=300,
+    )
+    tail["origin"]["model_call_id"] = "call-tail"
+    tail["causal_lane"] = "model-call:call-tail"
+    tail.update(
+        {
+            "cutoff_truncated": True,
+            "kind": "dispatch",
+            "record_id": "d-tail",
+            "source_started_at_ns": 200,
+            "elapsed_ns": 1_000,
+        }
+    )
+    bundle = make_bundle(
+        dispatches=[closed],
+        tools=[],
+        cutoff_tails={"operations": [tail], "llm_requests": []},
+    )
+    led = ledger(tmp_path, bundle, adapter="owl")
+
+    def payload(name: str) -> dict:
+        return {
+            "kind": "dispatch",
+            "actor_id": "actor-0",
+            "session_id": "actor-0",
+            "process_role": "agent",
+            "started_at_ns": 600,
+            "parser_identity": "parser",
+            "dispatcher_identity": "dispatcher",
+            "native_call_id": f"call-{name}",
+            "name": "shell",
+            "arguments": {"command": name},
+            "origin": {
+                "kind": "llm_structured",
+                "trigger_id": "llm-0",
+                "model_call_id": f"call-{name}",
+            },
+        }
+
+    with pytest.raises(WorkloadComplete, match="source cutoff tail"):
+        led.start(payload("tail"))
+    # Holding the truncated branch must not consume or block its closed sibling.
+    assert led.start(payload("closed"))["record_id"] == "d-closed"
+
+
+def test_closed_prefix_precedes_identical_cutoff_tail_in_same_lane(tmp_path: Path) -> None:
+    """A repeated browser action at cutoff must not shadow its earlier closed call."""
+
+    lane = "model-call:browser-call"
+    arguments = {"action_code": "fill_input_id(24, 'Carolyn Collins Petersen')"}
+    closed = tool(
+        call_id="tool-closed",
+        dispatch_id=None,
+        causal_lane=lane,
+        name="browser_action",
+        arguments=arguments,
+    )
+    tail = tool(
+        call_id="tool-tail",
+        dispatch_id=None,
+        causal_lane=lane,
+        name="browser_action",
+        arguments=arguments,
+    )
+    tail.update(
+        {
+            "cutoff_truncated": True,
+            "kind": "tool",
+            "record_id": "tool-tail",
+            "source_started_at_ns": 400,
+            "elapsed_ns": 1_000,
+        }
+    )
+    led = ledger(
+        tmp_path,
+        make_bundle(
+            dispatches=[],
+            tools=[closed],
+            cutoff_tails={"operations": [tail], "llm_requests": []},
+        ),
+        adapter="owl",
+    )
+    payload = start_tool(
+        dispatch_id=None,
+        causal_lane=lane,
+        name="browser_action",
+        arguments=arguments,
+    )
+
+    reservation = led.start(payload)
+    assert reservation["record_id"] == "tool-closed"
+    led.complete(
+        {
+            "reservation_id": reservation["reservation_id"],
+            "ended_at_ns": 300,
+            "status": "ok",
+            "result": {"output": [True, "Action was successful."]},
+            "native_execution": True,
+        }
+    )
+
+    with pytest.raises(MismatchError, match="cutoff-tail drift"):
+        led.start(
+            {
+                **payload,
+                "arguments": {"action_code": "click_id(25)"},
+            }
+        )
+    with pytest.raises(WorkloadComplete, match="source cutoff tail"):
+        led.start(payload)
+
+
 def test_fast_claim_skips_the_digest_compare(tmp_path: Path) -> None:
     led = ledger(tmp_path, make_bundle(), fast_claim=True)
     assert led.start(start_tool(arguments={"command": "anything"}))["record_id"] == "tool-0"
@@ -177,6 +340,30 @@ def test_unexpected_operation_is_rejected(tmp_path: Path) -> None:
         led.start(start_tool())
 
 
+def test_completed_operation_lane_holds_extra_before_native_entry(tmp_path: Path) -> None:
+    recorded = tool(
+        causal_lane="model-call:call-a",
+        dispatch_id=None,
+    )
+    led = ledger(tmp_path, make_bundle(tools=[recorded]))
+    payload = start_tool()
+    payload["dispatch_id"] = None
+    payload["causal_lane"] = "model-call:call-a"
+    reservation = led.start(payload)
+    led.complete(
+        {
+            "reservation_id": reservation["reservation_id"],
+            "ended_at_ns": 300,
+            "status": "ok",
+            "result": {"output": "done"},
+            "native_execution": True,
+        }
+    )
+
+    with pytest.raises(WorkloadComplete, match="recorded window closed"):
+        led.start(payload)
+
+
 def test_missing_operations_are_reported(tmp_path: Path) -> None:
     led = ledger(tmp_path, make_bundle())
     with pytest.raises(MismatchError, match="missing native operations"):
@@ -202,4 +389,25 @@ def test_expected_complete_ignores_diagnostic_tail(tmp_path: Path) -> None:
         },
     )
     led = ledger(tmp_path, bundle)
+    assert led.expected_complete() is True
+
+
+def test_claimed_operation_waits_for_completion_response_delivery(tmp_path: Path) -> None:
+    led = ledger(tmp_path, make_bundle(tools=[tool()], dispatches=[]))
+    reservation = led.start(start_tool())
+    identity = ("tool", reservation["record_id"])
+    led.complete(
+        {
+            "reservation_id": reservation["reservation_id"],
+            "ended_at_ns": 300,
+            "status": "ok",
+            "result": {"output": "ok"},
+            "native_execution": True,
+        },
+        defer_delivery=True,
+    )
+
+    assert led.expected_complete() is False
+    assert led.outstanding()["evidence_not_delivered"] == ["tool:tool-0"]
+    led.mark_delivered(identity)
     assert led.expected_complete() is True

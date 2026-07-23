@@ -56,7 +56,10 @@ def close_stage_at_cutoff(stage_dir: Path) -> dict[str, Any]:
         changed = False
 
         surviving = [
-            tool for tool in kept["tool"] if str(tool.get("dispatch_id")) in ids["dispatch"]
+            tool
+            for tool in kept["tool"]
+            if tool.get("dispatch_id") is None
+            or str(tool.get("dispatch_id")) in ids["dispatch"]
         ]
         if len(surviving) != len(kept["tool"]):
             kept["tool"] = surviving
@@ -92,6 +95,29 @@ def close_stage_at_cutoff(stage_dir: Path) -> dict[str, Any]:
             kept["grader"] = surviving
             changed = True
 
+        # A completed child is not a replayable prefix when its parent operation
+        # was still open at cutoff.  Parent links live on spans because they cross
+        # LLM, tool and dispatch kinds; pruning them here closes the graph without
+        # adapter- or role-specific rules.  Records whose instrumentation emitted
+        # no span remain eligible for the legacy dependency checks above.
+        span_ids = {str(span["span_id"]) for span in spans}
+        orphan_spans = {
+            str(span["span_id"])
+            for span in spans
+            if span.get("parent_span_id") is not None
+            and str(span["parent_span_id"]) not in span_ids
+        }
+        if orphan_spans:
+            for kind, records in kept.items():
+                surviving = [
+                    record
+                    for record in records
+                    if str(record.get("span_id")) not in orphan_spans
+                ]
+                if len(surviving) != len(records):
+                    kept[kind] = surviving
+                    changed = True
+
         live = {
             str(record["span_id"])
             for records in kept.values()
@@ -105,14 +131,6 @@ def close_stage_at_cutoff(stage_dir: Path) -> dict[str, Any]:
 
         if not changed:
             break
-
-    # A record survived but its parent span may not have. Re-root rather than drop:
-    # the operation really happened inside the window, only its context is gone.
-    span_ids = {str(span["span_id"]) for span in spans}
-    for span in spans:
-        parent = span.get("parent_span_id")
-        if parent is not None and str(parent) not in span_ids:
-            span["parent_span_id"] = None
 
     for kind, relative in _LEDGERS.items():
         _rewrite(stage_dir, relative, kept[kind])

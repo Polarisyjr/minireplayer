@@ -9,6 +9,25 @@ from collections.abc import Sequence
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,191}$")
 
 
+def resolved_output_prefix(output_token_ids: Sequence[int]) -> tuple[list[int], int]:
+    """Split vLLM's committed output from async-scheduling placeholders.
+
+    With async scheduling, vLLM optimistically appends one or more ``-1``
+    entries until the preceding GPU-to-CPU token copy is visible.  Real token
+    IDs must still form an exact prefix; a real ID after a placeholder would
+    mean the engine's bookkeeping no longer has the shape replay relies on.
+    """
+
+    values = list(output_token_ids)
+    try:
+        first_placeholder = values.index(-1)
+    except ValueError:
+        first_placeholder = len(values)
+    if any(token_id != -1 for token_id in values[first_placeholder:]):
+        raise ValueError("native replay output placeholders are not a trailing run")
+    return values[:first_placeholder], len(values) - first_placeholder
+
+
 def token_payload(request_id: str, token_ids: Sequence[int]) -> bytes:
     return f"{request_id}:{','.join(str(token) for token in token_ids)}".encode()
 

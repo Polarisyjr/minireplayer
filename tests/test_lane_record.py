@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from minireplay.lane_record import local_complete, local_start, materialize_lane_recording
+from minireplay.lane_record import (
+    composite_scope_rows,
+    local_complete,
+    local_composite_scope_complete,
+    local_composite_scope_start,
+    local_start,
+    materialize_lane_recording,
+)
 from minireplay.observation import exact_result_contract
 from minireplay.util import iter_jsonl
 
@@ -119,6 +126,8 @@ def test_lane_events_materialize_closed_prefix_and_cutoff_tail(tmp_path: Path) -
     assert dispatches[0]["dispatch_id"] == dispatch["record_id"]
     assert dispatches[0]["execution_call_id"] == tool["record_id"]
     assert tools[0]["call_id"] == tool["record_id"]
+    assert dispatches[0]["causal_lane"] == "session:actor-0|trigger:llm-0"
+    assert tools[0]["causal_lane"] == dispatches[0]["causal_lane"]
     assert {span["span_id"] for span in spans} == {dispatch["span_id"], tool["span_id"]}
     assert len(tails) == 1
     assert tails[0]["kind"] == "grader"
@@ -144,3 +153,90 @@ def test_different_actors_write_different_lane_files(tmp_path: Path) -> None:
         )
 
     assert len(list(tmp_path.glob("lane-*.jsonl"))) == 2
+
+
+def test_composite_scope_is_diagnostic_only(tmp_path: Path) -> None:
+    events = tmp_path / "lane-events"
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    actor = "actor-0"
+    scope_id = local_composite_scope_start(
+        root=events,
+        actor_id=actor,
+        session_id=actor,
+        name="browse_url",
+        causal_lane="model-call:browse-0",
+        started_at_ns=100,
+    )
+    local_composite_scope_complete(
+        root=events,
+        actor_id=actor,
+        session_id=actor,
+        scope_id=scope_id,
+        ended_at_ns=250,
+        status="ok",
+    )
+
+    tails = materialize_lane_recording(
+        event_dir=events,
+        stage_dir=stage,
+        cutoff_at_ns=300,
+        auth_token="unused",
+        adapter="owl",
+        run_root=tmp_path,
+        repo=tmp_path,
+    )
+
+    assert tails == []
+    assert not (stage / "dispatches.jsonl").exists()
+    assert not (stage / "tools.jsonl").exists()
+    assert composite_scope_rows(events, 300) == [
+        {
+            "scope_id": scope_id,
+            "actor_id": actor,
+            "session_id": actor,
+            "name": "browse_url",
+            "causal_lane": "model-call:browse-0",
+            "started_at_ns": 100,
+            "ended_at_ns": 250,
+            "status": "ok",
+            "cutoff_truncated": False,
+        }
+    ]
+
+
+def test_open_composite_scope_is_not_a_cutoff_tail(tmp_path: Path) -> None:
+    events = tmp_path / "lane-events"
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    scope_id = local_composite_scope_start(
+        root=events,
+        actor_id="actor-0",
+        session_id="actor-0",
+        name="browse_url",
+        causal_lane="model-call:browse-0",
+        started_at_ns=100,
+    )
+
+    tails = materialize_lane_recording(
+        event_dir=events,
+        stage_dir=stage,
+        cutoff_at_ns=300,
+        auth_token="unused",
+        adapter="owl",
+        run_root=tmp_path,
+        repo=tmp_path,
+    )
+
+    assert tails == []
+    assert composite_scope_rows(events, 300)[0] == {
+        "scope_id": scope_id,
+        "actor_id": "actor-0",
+        "session_id": "actor-0",
+        "name": "browse_url",
+        "causal_lane": "model-call:browse-0",
+        "started_at_ns": 100,
+        "ended_at_ns": 300,
+        "status": "truncated",
+        "cutoff_truncated": True,
+    }

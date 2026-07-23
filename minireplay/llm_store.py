@@ -203,6 +203,12 @@ class LLMStore:
         # wall-clock times during replay.
         self.actor_complete: Any = None
         self._consumed = 0
+        # A replay claim only reserves the source slot.  Completion is split into
+        # evidence written and response delivered so the supervisor cannot tear
+        # down the final engine request (or its framework-visible response) while
+        # it is still in flight.
+        self._completed: set[str] = set()
+        self._delivered: set[str] = set()
         # Requests forwarded upstream but not yet answered. Whatever is still here
         # when the sweep closes the window is a tail the source never finished.
         self._inflight: dict[str, dict[str, Any]] = {}
@@ -264,7 +270,16 @@ class LLMStore:
             actor_complete = self.actor_complete is not None and self.actor_complete(
                 identity.actor_id
             )
-            if whole_run_complete or actor_complete:
+            # Independent framework branches sharing one actor can reach their
+            # source-window boundary at different replay wall times. Once this
+            # non-empty LLM lane has delivered every recorded response, its next
+            # request is past the known prefix and must wait without inventing
+            # work while sibling lanes finish. An empty lane, or one whose final
+            # response is merely claimed/in flight, remains hard drift.
+            lane_complete = bool(queue) and all(
+                str(record["attempt_id"]) in self._delivered for record in queue
+            )
+            if whole_run_complete or actor_complete or lane_complete:
                 raise WorkloadComplete(
                     f"LLM request for {key} arrived after the recorded window closed"
                 )
@@ -545,6 +560,17 @@ class LLMStore:
                 "sequence": sequence,
                 "api": api,
                 "request": request_body,
+                # canonical_json sorts mapping keys when the JSONL is persisted.
+                # That is normally semantically harmless, but chat templates may
+                # iterate a tool's JSON Schema in insertion order, making the key
+                # order part of the engine prompt tokens. Keep one opaque encoding
+                # of the parsed request so full replay can reconstruct the exact
+                # mapping order that recording forwarded upstream.
+                "request_ordered_json": json.dumps(
+                    request_body,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
                 "request_sha256": sha256_json(request_body),
                 "request_shape_sha256": sha256_json(request_shape(request_body)),
                 "response": response,
@@ -586,12 +612,20 @@ class LLMStore:
         if self.replay_mode == "full":
             await self._run_upstream(identity, api, expected)
         self._index_model_calls(str(expected["attempt_id"]), expected["response"])
-        self._consumed += 1
         self._write_replay_attempt(expected, identity, started, monotonic_ns())
         if expected["stream"]:
-            return await self._replay_stream(request, expected)
-        response = web.json_response(expected["response"], status=expected["status_code"])
-        response.headers["X-Native-Replay-Attempt"] = str(expected["attempt_id"])
+            response = await self._replay_stream(request, expected)
+        else:
+            response = web.json_response(expected["response"], status=expected["status_code"])
+            response.headers["X-Native-Replay-Attempt"] = str(expected["attempt_id"])
+            # aiohttp normally writes a plain Response after the handler returns.
+            # Do it here so delivery, not handler construction, is the completion
+            # barrier observed by the supervisor.
+            await response.prepare(request)
+            await response.write_eof()
+        attempt_id = str(expected["attempt_id"])
+        self._delivered.add(attempt_id)
+        self._consumed += 1
         return response
 
     async def _replay_stream(
@@ -718,6 +752,7 @@ class LLMStore:
                 "ended_at_ns": ended,
             },
         )
+        self._completed.add(str(expected["attempt_id"]))
 
     async def _hold_past_window(self) -> web.StreamResponse:
         """Never respond. See errors.WorkloadComplete."""
@@ -763,9 +798,10 @@ class LLMStore:
     def expected_complete(self) -> bool:
         if self.mode != "replay":
             return False
-        for key, queue in self._expected.items():
-            if self._replay_sequence.get(key, 0) < len(queue):
-                return False
+        for queue in self._expected.values():
+            for record in queue:
+                if str(record["attempt_id"]) not in self._delivered:
+                    return False
         now = monotonic_ns()
         for attempt_id, required in self._truncated_elapsed.items():
             started = self._truncated_started.get(attempt_id)
@@ -782,11 +818,11 @@ class LLMStore:
         for key, queue in self._expected.items():
             if key[0] != actor_id:
                 continue
-            if self._replay_sequence.get(key, 0) < len(queue):
-                return False
             for record in queue:
                 attempt_id = str(record["attempt_id"])
                 if attempt_id not in self._truncated:
+                    if attempt_id not in self._delivered:
+                        return False
                     continue
                 started = self._truncated_started.get(attempt_id)
                 required = self._truncated_elapsed[attempt_id]
@@ -812,11 +848,24 @@ class LLMStore:
 
     def outstanding(self) -> dict[str, Any]:
         missing = {
-            f"{key}": len(queue) - self._replay_sequence.get(key, 0)
+            f"{key}": sum(
+                str(record["attempt_id"]) not in self._delivered for record in queue
+            )
             for key, queue in self._expected.items()
-            if self._replay_sequence.get(key, 0) < len(queue)
+            if any(str(record["attempt_id"]) not in self._delivered for record in queue)
         }
-        return {"missing_llm": missing, "consumed": self._consumed}
+        claimed_not_delivered = sorted(
+            str(record["attempt_id"])
+            for key, queue in self._expected.items()
+            for record in queue[: self._replay_sequence.get(key, 0)]
+            if str(record["attempt_id"]) not in self._delivered
+        )
+        return {
+            "missing_llm": missing,
+            "claimed_not_delivered": claimed_not_delivered,
+            "evidence_not_delivered": sorted(self._completed - self._delivered),
+            "consumed": self._consumed,
+        }
 
     def assert_consumed(self) -> None:
         report = self.outstanding()

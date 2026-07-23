@@ -558,6 +558,7 @@ class Supervisor:
             services.stop()
             self._remove_external_tmux_dir()
 
+        observed_records: dict[str, list[dict[str, Any]]] | None = None
         if self.mode == "record" and failure is None:
             try:
                 cutoff_tails["operations"] = materialize_lane_recording(
@@ -569,6 +570,10 @@ class Supervisor:
                     run_root=self.output,
                     repo=self.config.repo,
                 )
+                # Step3 describes what was observed inside the source window.
+                # Preserve that view before causal closure removes completed
+                # descendants of an operation that remained open at cutoff.
+                observed_records = self._stage_records()
             except BaseException as exc:  # noqa: BLE001 - becomes the run failure
                 failure = exc
 
@@ -602,8 +607,9 @@ class Supervisor:
                 output=self.output,
                 run_id=self.run_id,
                 framework=self.config.framework,
-                records=records,
+                records=observed_records or records,
                 cutoff_tails=cutoff_tails,
+                scope_event_dir=self.lane_event_dir,
                 gate_at_ns=metrics.gate_at_ns,
                 gate_at_epoch_ns=int(gate["opened_at_epoch_ns"]),
                 terminal_at_ns=metrics.terminal_at_ns,

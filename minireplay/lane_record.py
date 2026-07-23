@@ -118,6 +118,64 @@ def local_complete(
     return response
 
 
+def local_composite_scope_start(
+    *,
+    root: Path,
+    actor_id: str,
+    session_id: str,
+    name: str,
+    causal_lane: str,
+    started_at_ns: int,
+) -> str:
+    """Record a diagnostic-only orchestration envelope.
+
+    Composite scopes are deliberately not boundary reservations: they never enter
+    the replay bundle, operation counts, completion protocol, or cutoff closure.
+    The local event exists only so source visualizations can draw a transparent
+    envelope around the primitive tools and model calls that do carry replay
+    semantics.
+    """
+
+    scope_id = f"scope-{secrets.token_hex(12)}"
+    append_lane_event(
+        root,
+        {
+            "schema_version": LANE_RECORD_EVENT_SCHEMA,
+            "event": "scope-start",
+            "actor_id": actor_id,
+            "session_id": session_id,
+            "scope_id": scope_id,
+            "name": name,
+            "causal_lane": causal_lane,
+            "at_ns": started_at_ns,
+        },
+    )
+    return scope_id
+
+
+def local_composite_scope_complete(
+    *,
+    root: Path,
+    actor_id: str,
+    session_id: str,
+    scope_id: str,
+    ended_at_ns: int,
+    status: str,
+) -> None:
+    append_lane_event(
+        root,
+        {
+            "schema_version": LANE_RECORD_EVENT_SCHEMA,
+            "event": "scope-complete",
+            "actor_id": actor_id,
+            "session_id": session_id,
+            "scope_id": scope_id,
+            "status": status,
+            "at_ns": ended_at_ns,
+        },
+    )
+
+
 def _events(root: Path) -> list[dict[str, Any]]:
     values: list[dict[str, Any]] = []
     if not root.is_dir():
@@ -129,12 +187,72 @@ def _events(root: Path) -> list[dict[str, Any]]:
             value.get("schema_version") == LANE_RECORD_EVENT_SCHEMA,
             "lane record: unsupported event schema",
         )
-        require(value.get("event") in {"start", "complete"}, "lane record: invalid event")
+        require(
+            value.get("event") in {"start", "complete", "scope-start", "scope-complete"},
+            "lane record: invalid event",
+        )
         require(isinstance(value.get("at_ns"), int), "lane record: invalid event time")
     # Completion timestamps are captured before their append.  Sorting by those
     # observed times reconstructs the causal order even when different lane files
     # are drained in filesystem order.
-    return sorted(values, key=lambda value: (int(value["at_ns"]), value["event"] != "start"))
+    return sorted(
+        values,
+        key=lambda value: (
+            int(value["at_ns"]),
+            value["event"] not in {"start", "scope-start"},
+        ),
+    )
+
+
+def composite_scope_rows(event_dir: Path, cutoff_at_ns: int) -> list[dict[str, Any]]:
+    """Materialize diagnostic composite envelopes without touching the ledger."""
+
+    starts: dict[str, dict[str, Any]] = {}
+    completions: dict[str, dict[str, Any]] = {}
+    for event in _events(event_dir):
+        event_kind = event["event"]
+        if event_kind == "scope-start":
+            scope_id = str(event.get("scope_id"))
+            require(scope_id not in starts, f"lane record: duplicate composite scope {scope_id}")
+            starts[scope_id] = event
+        elif event_kind == "scope-complete":
+            scope_id = str(event.get("scope_id"))
+            require(
+                scope_id in starts,
+                f"lane record: composite completion before start {scope_id}",
+            )
+            require(
+                scope_id not in completions,
+                f"lane record: duplicate composite completion {scope_id}",
+            )
+            completions[scope_id] = event
+
+    rows: list[dict[str, Any]] = []
+    for scope_id, start in starts.items():
+        started = int(start["at_ns"])
+        if started > cutoff_at_ns:
+            continue
+        completion = completions.get(scope_id)
+        completed_at = int(completion["at_ns"]) if completion is not None else None
+        truncated = completed_at is None or completed_at > cutoff_at_ns
+        rows.append(
+            {
+                "scope_id": scope_id,
+                "actor_id": str(start["actor_id"]),
+                "session_id": str(start.get("session_id") or start["actor_id"]),
+                "name": str(start.get("name") or "composite"),
+                "causal_lane": str(start.get("causal_lane") or ""),
+                "started_at_ns": started,
+                "ended_at_ns": cutoff_at_ns if truncated else completed_at,
+                "status": (
+                    "truncated"
+                    if truncated
+                    else str((completion or {}).get("status") or "ok")
+                ),
+                "cutoff_truncated": truncated,
+            }
+        )
+    return sorted(rows, key=lambda row: (row["started_at_ns"], row["scope_id"]))
 
 
 def materialize_lane_recording(
@@ -167,6 +285,9 @@ def materialize_lane_recording(
     completed: set[str] = set()
 
     for event in _events(event_dir):
+        if event["event"] in {"scope-start", "scope-complete"}:
+            # Diagnostic envelopes never become replay reservations.
+            continue
         local_id = str(event["reservation_id"])
         if event["event"] == "start":
             require(local_id not in started, f"lane record: duplicate start {local_id}")

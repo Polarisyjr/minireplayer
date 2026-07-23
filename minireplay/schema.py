@@ -8,6 +8,7 @@ not for content, because their content is diagnostic by design.
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from typing import Any
 
@@ -21,6 +22,7 @@ from .constants import (
     TERMINAL_SCHEMA,
     TOOL_SCHEMA,
 )
+from .errors import ValidationError
 from .observation import validate_result_contract
 from .util import require, sha256_json
 
@@ -79,6 +81,11 @@ def validate_dispatch(value: dict[str, Any]) -> None:
     )
     origin = _object(value.get("origin"), "dispatch.origin")
     _string(origin.get("kind"), "dispatch.origin.kind")
+    causal_lane = value.get("causal_lane")
+    require(
+        causal_lane is None or (isinstance(causal_lane, str) and bool(causal_lane)),
+        "dispatch.causal_lane: expected a non-empty string or null",
+    )
     require(
         value.get("status") in {"executed", "rejected", "failed-before-entry"},
         "dispatch.status: invalid resolution",
@@ -97,9 +104,23 @@ def validate_dispatch(value: dict[str, Any]) -> None:
 
 def validate_tool(value: dict[str, Any]) -> None:
     require(value.get("schema_version") == TOOL_SCHEMA, "tool: unsupported schema")
-    for field in ("call_id", "dispatch_id", "span_id", "actor_id", "name", "implementation"):
+    for field in ("call_id", "span_id", "actor_id", "name", "implementation"):
         _string(value.get(field), f"tool.{field}")
+    dispatch_id = value.get("dispatch_id")
+    require(
+        dispatch_id is None or (isinstance(dispatch_id, str) and bool(dispatch_id)),
+        "tool.dispatch_id: expected a non-empty string or null",
+    )
     _object(value.get("arguments"), "tool.arguments")
+    causal_lane = value.get("causal_lane")
+    require(
+        causal_lane is None or (isinstance(causal_lane, str) and bool(causal_lane)),
+        "tool.causal_lane: expected a non-empty string or null",
+    )
+    require(
+        dispatch_id is not None or causal_lane is not None,
+        "tool: a standalone tool requires a causal_lane",
+    )
     require(
         value.get("arguments_sha256") == sha256_json(value["arguments"]),
         f"tool {value['call_id']}: arguments digest does not match its arguments",
@@ -161,6 +182,22 @@ def validate_llm(value: dict[str, Any]) -> None:
         "llm.sequence: expected a non-negative integer",
     )
     _object(value.get("request"), "llm.request")
+    ordered_request = value.get("request_ordered_json")
+    if ordered_request is not None:
+        require(
+            isinstance(ordered_request, str) and bool(ordered_request),
+            "llm.request_ordered_json: expected a non-empty string",
+        )
+        try:
+            decoded_request = json.loads(ordered_request)
+        except json.JSONDecodeError as exc:
+            raise ValidationError(
+                f"llm.request_ordered_json: malformed JSON: {exc}"
+            ) from exc
+        require(
+            isinstance(decoded_request, dict) and decoded_request == value["request"],
+            "llm.request_ordered_json: ordered request does not match request",
+        )
     require(
         value.get("request_sha256") == sha256_json(value["request"]),
         f"llm {value['attempt_id']}: request digest does not match its request",
@@ -260,10 +297,12 @@ def validate_causal_graph(
             f"dispatch {dispatch['dispatch_id']}: execution {execution} is not in the bundle",
         )
     for tool in tools:
-        require(
-            tool["dispatch_id"] in dispatch_ids,
-            f"tool {tool['call_id']}: dispatch {tool['dispatch_id']} is not in the bundle",
-        )
+        dispatch_id = tool.get("dispatch_id")
+        if dispatch_id is not None:
+            require(
+                dispatch_id in dispatch_ids,
+                f"tool {tool['call_id']}: dispatch {dispatch_id} is not in the bundle",
+            )
 
     owners: dict[str, str] = {}
     for dispatch in dispatches:

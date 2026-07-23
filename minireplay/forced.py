@@ -401,7 +401,25 @@ def forced_upstream_body(
     Only the integer committed at each in-window step is replaced, after sampling.
     """
 
-    body = copy.deepcopy(recorded_request)
+    ordered_json = expected.get("request_ordered_json")
+    if ordered_json is None:
+        # Backward compatibility for bundles recorded before ordered request
+        # encodings were added. Such a bundle remains usable when its chat
+        # template is insensitive to mapping order.
+        body = copy.deepcopy(recorded_request)
+    else:
+        require(
+            isinstance(ordered_json, str) and bool(ordered_json),
+            "recorded ordered LLM request is invalid",
+        )
+        try:
+            body = json.loads(ordered_json)
+        except json.JSONDecodeError as exc:
+            raise ValidationError(f"recorded ordered LLM request is malformed: {exc}") from exc
+        require(
+            isinstance(body, dict) and body == recorded_request,
+            "recorded ordered LLM request does not match its canonical request",
+        )
     if api == "chat.completions":
         require(body.get("n", 1) == 1, "forced replay supports one completion per request")
         body["return_token_ids"] = True

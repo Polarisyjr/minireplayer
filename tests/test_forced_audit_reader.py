@@ -5,7 +5,7 @@ import json
 import threading
 from pathlib import Path
 
-from minireplay.forced import ForcedAuditReader, token_digest
+from minireplay.forced import ForcedAuditReader, forced_upstream_body, token_digest
 
 
 def capture_record(request_id: str, *, prompt: list[int] | None = None) -> dict:
@@ -117,3 +117,40 @@ async def test_audit_read_does_not_block_the_event_loop(tmp_path: Path) -> None:
     # was moved off the aiohttp event loop.
     release.set()
     assert (await waiting)["request_id"] == "off-loop"
+
+
+def test_forced_body_restores_recorded_mapping_order() -> None:
+    """Canonical JSONL ordering must not change chat-template prompt tokens."""
+
+    parameters = {
+        "properties": {"assignee_id": {"type": "string"}},
+        "required": ["assignee_id"],
+        "additionalProperties": False,
+        "type": "object",
+    }
+    live_request = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "assign"}],
+        "tools": [{"type": "function", "function": {"name": "pick", "parameters": parameters}}],
+    }
+    # This is what loading a canonical-json line used to do to the request.
+    canonical_request = json.loads(json.dumps(live_request, sort_keys=True))
+    expected = {
+        "attempt_id": "llm-order",
+        "status_code": 200,
+        "request_ordered_json": json.dumps(live_request, separators=(",", ":")),
+        "prompt_token_ids": [1, 2],
+        "response_token_ids": [3],
+        "engine": {"committed_sample_start": 0, "sampled_token_count": 1},
+    }
+
+    body = forced_upstream_body(
+        canonical_request,
+        expected,
+        api="chat.completions",
+        secret="secret",
+        audit_namespace="run",
+    )
+
+    restored = body["tools"][0]["function"]["parameters"]
+    assert list(restored) == ["properties", "required", "additionalProperties", "type"]

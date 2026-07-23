@@ -73,3 +73,23 @@ def test_token_order_is_part_of_the_signature() -> None:
     assert proxy.sign_tokens(SECRET, REQUEST_ID, [1, 2]) != proxy.sign_tokens(
         SECRET, REQUEST_ID, [2, 1]
     )
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        ([], ([], 0)),
+        ([11, 22], ([11, 22], 0)),
+        ([11, 22, -1], ([11, 22], 1)),
+        ([11, -1, -1], ([11], 2)),
+    ],
+)
+def test_async_output_placeholders_are_split_from_the_resolved_prefix(
+    values: list[int], expected: tuple[list[int], int]
+) -> None:
+    assert engine.resolved_output_prefix(values) == expected
+
+
+def test_async_output_placeholders_must_be_a_trailing_run() -> None:
+    with pytest.raises(ValueError, match="not a trailing run"):
+        engine.resolved_output_prefix([11, -1, 22])

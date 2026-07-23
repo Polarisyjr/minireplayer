@@ -13,7 +13,12 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from .errors import MismatchError
-from .lane_record import local_complete, local_start
+from .lane_record import (
+    local_complete,
+    local_composite_scope_complete,
+    local_composite_scope_start,
+    local_start,
+)
 from .observation import exact_result_contract
 from .serialization import jsonable
 from .util import atomic_write_json, monotonic_ns
@@ -28,6 +33,7 @@ _llm_role = contextvars.ContextVar("minireplay_llm_role", default="agent")
 _target = contextvars.ContextVar("minireplay_target", default="default")
 _dispatch = contextvars.ContextVar("minireplay_dispatch", default=None)
 _tool_call = contextvars.ContextVar("minireplay_tool_call", default=None)
+_composite_lane = contextvars.ContextVar("minireplay_composite_lane", default=None)
 _grader_call = contextvars.ContextVar("minireplay_grader_call", default=None)
 _last_llm_attempt = contextvars.ContextVar("minireplay_last_llm_attempt", default=None)
 _captured_children: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar(
@@ -124,6 +130,7 @@ def current_context() -> dict[str, str | None]:
         ),
         "dispatch_id": _dispatch.get(),
         "tool_call_id": _tool_call.get(),
+        "composite_lane": _composite_lane.get(),
         "grader_attempt_id": _grader_call.get(),
     }
 
@@ -287,6 +294,52 @@ def llm_scope(role: str, *, target_id: str | None = None):
         _llm_role.reset(role_token)
 
 
+@contextmanager
+def composite_scope(*, name: str, model_call_id: str):
+    """Enter a diagnostic-only composite orchestration scope.
+
+    A composite such as Owl's ``browse_url`` is a container for model calls and
+    replayable primitives, not a tool operation of its own.  It therefore creates
+    no boundary reservation and no parent span.  Its stable model-call lane is
+    inherited by standalone primitives so concurrent composites remain independent.
+    """
+
+    if not name or not model_call_id:
+        raise ValueError("composite scope requires a name and model call ID")
+    lane = f"model-call:{model_call_id}"
+    lane_token = _composite_lane.set(lane)
+    root_value = os.environ.get("NATIVE_REPLAY_LANE_EVENT_DIR")
+    record_scope = os.environ.get("NATIVE_REPLAY_MODE") == "record" and bool(root_value)
+    root = Path(str(root_value)) if record_scope else None
+    scope_id = None
+    if root is not None:
+        scope_id = local_composite_scope_start(
+            root=root,
+            actor_id=_actor.get(),
+            session_id=_session.get(),
+            name=name,
+            causal_lane=lane,
+            started_at_ns=time.monotonic_ns(),
+        )
+    status = "ok"
+    try:
+        yield
+    except BaseException:
+        status = "error"
+        raise
+    finally:
+        if root is not None and scope_id is not None:
+            local_composite_scope_complete(
+                root=root,
+                actor_id=_actor.get(),
+                session_id=_session.get(),
+                scope_id=scope_id,
+                ended_at_ns=time.monotonic_ns(),
+                status=status,
+            )
+        _composite_lane.reset(lane_token)
+
+
 def report_task_terminal(
     *,
     result: Any,
@@ -398,7 +451,12 @@ class BoundaryClient:
             self._reservations[reservation] = (kind, record_id, actor_id, session_id)
             if kind == "tool":
                 executions = _captured_dispatch_executions.get()
-                if executions is not None and record_id not in executions:
+                if (
+                    executions is not None
+                    and payload.get("dispatch_id") is not None
+                    and _tool_call.get() is None
+                    and record_id not in executions
+                ):
                     executions.append(record_id)
                 records = _captured_tool_calls.get()
                 if records is not None and record_id not in records:
@@ -576,12 +634,15 @@ def run_tool(
     client: BoundaryClient | None = None,
 ) -> Any:
     boundary = client or BoundaryClient()
-    dispatch_id = _dispatch.get()
-    if not isinstance(dispatch_id, str) or not dispatch_id:
+    composite_lane = _composite_lane.get()
+    dispatch_id = None if composite_lane is not None else _dispatch.get()
+    if composite_lane is None and (not isinstance(dispatch_id, str) or not dispatch_id):
         raise MismatchError("native tool execution escaped the framework dispatch ledger")
+    direct_execution = composite_lane is None and _tool_call.get() is None
     reservation = boundary.start(
         "tool",
         dispatch_id=dispatch_id,
+        causal_lane=composite_lane,
         name=name,
         implementation=implementation,
         arguments=arguments,
@@ -589,7 +650,11 @@ def run_tool(
         semantic_timeout_s=semantic_timeout_s,
     )
     executions = _captured_dispatch_executions.get()
-    if executions is not None and reservation["record_id"] not in executions:
+    if (
+        direct_execution
+        and executions is not None
+        and reservation["record_id"] not in executions
+    ):
         executions.append(reservation["record_id"])
     cpu_started_ns = time.thread_time_ns()
     child_token = _captured_children.set([])
@@ -657,12 +722,15 @@ async def run_tool_async(
     client: BoundaryClient | None = None,
 ) -> Any:
     boundary = client or BoundaryClient()
-    dispatch_id = _dispatch.get()
-    if not isinstance(dispatch_id, str) or not dispatch_id:
+    composite_lane = _composite_lane.get()
+    dispatch_id = None if composite_lane is not None else _dispatch.get()
+    if composite_lane is None and (not isinstance(dispatch_id, str) or not dispatch_id):
         raise MismatchError("native tool execution escaped the framework dispatch ledger")
+    direct_execution = composite_lane is None and _tool_call.get() is None
     reservation = boundary.start(
         "tool",
         dispatch_id=dispatch_id,
+        causal_lane=composite_lane,
         name=name,
         implementation=implementation,
         arguments=arguments,
@@ -670,7 +738,11 @@ async def run_tool_async(
         semantic_timeout_s=semantic_timeout_s,
     )
     executions = _captured_dispatch_executions.get()
-    if executions is not None and reservation["record_id"] not in executions:
+    if (
+        direct_execution
+        and executions is not None
+        and reservation["record_id"] not in executions
+    ):
         executions.append(reservation["record_id"])
     cpu_started_ns = time.thread_time_ns()
     child_token = _captured_children.set([])

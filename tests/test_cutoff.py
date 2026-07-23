@@ -6,7 +6,7 @@ from pathlib import Path
 
 from minireplay.cutoff import close_stage_at_cutoff
 from minireplay.util import append_jsonl, iter_jsonl
-from tests.support import dispatch, span, tool
+from tests.support import dispatch, llm, span, tool
 
 
 def stage(tmp_path: Path, **records) -> Path:
@@ -73,7 +73,7 @@ def test_pruning_cascades_to_a_fixed_point(tmp_path: Path) -> None:
     assert ids(root, "tools.jsonl", "call_id") == set()
 
 
-def test_a_surviving_record_keeps_its_span_but_loses_a_dropped_parent(tmp_path: Path) -> None:
+def test_missing_parent_drops_the_whole_descendant_branch(tmp_path: Path) -> None:
     root = stage(
         tmp_path,
         **{
@@ -86,11 +86,29 @@ def test_a_surviving_record_keeps_its_span_but_loses_a_dropped_parent(tmp_path: 
         },
     )
     close_stage_at_cutoff(root)
-    spans = {
-        record["span_id"]: record["parent_span_id"]
-        for record in iter_jsonl(root / "spans.jsonl")
-    }
-    assert spans == {"span-d-0": None, "span-tool-0": "span-d-0"}
+    assert ids(root, "dispatches.jsonl", "dispatch_id") == set()
+    assert ids(root, "tools.jsonl", "call_id") == set()
+    assert list(iter_jsonl(root / "spans.jsonl")) == []
+
+
+def test_llm_below_a_cutoff_tool_is_not_fixed_work(tmp_path: Path) -> None:
+    child = llm(attempt_id="llm-child")
+    root = stage(
+        tmp_path,
+        **{
+            "llm.jsonl": [child],
+            "spans.jsonl": [
+                {
+                    **span(child["span_id"], parent="span-tool-cutoff"),
+                    "kind": "llm",
+                    "name": "llm:browser",
+                }
+            ],
+        },
+    )
+    close_stage_at_cutoff(root)
+    assert ids(root, "llm.jsonl", "attempt_id") == set()
+    assert list(iter_jsonl(root / "spans.jsonl")) == []
 
 
 def test_report_counts_what_was_discarded(tmp_path: Path) -> None:

@@ -17,6 +17,7 @@ from vllm.v1.sample.logits_processor.interface import (
 
 from .protocol import (
     audit_payload,
+    resolved_output_prefix,
     validate_capture,
     validate_request,
     validate_sampler_window,
@@ -289,23 +290,44 @@ class ForcedSequenceProcessor(LogitsProcessor):
                 )
             position = sample_index - start
             if 0 <= position < len(state.token_ids):
-                if any(token_id < 0 for token_id in state.output_token_ids):
-                    raise RuntimeError(
-                        f"native replay unresolved output placeholder for {state.request_id}"
+                try:
+                    resolved_output, _ = resolved_output_prefix(
+                        state.output_token_ids
                     )
-                if list(state.output_token_ids) != state.token_ids[:position]:
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"native replay malformed output placeholders for "
+                        f"{state.request_id}"
+                    ) from exc
+                if (
+                    len(resolved_output) > position
+                    or resolved_output != state.token_ids[: len(resolved_output)]
+                    or len(state.output_token_ids) > position + 1
+                ):
                     raise RuntimeError(
                         f"native replay commit-position drift for {state.request_id}: "
-                        f"output={len(state.output_token_ids)}, expected={position}"
+                        f"resolved_output={len(resolved_output)}, "
+                        f"logical_output={len(state.output_token_ids)}, "
+                        f"expected={position}"
                     )
                 token_id = state.token_ids[position]
                 sampled[request_index] = token_id
                 state.forced_count += 1
-            elif position >= len(state.token_ids) and list(
-                state.output_token_ids
-            )[: len(state.token_ids)] != state.token_ids:
-                raise RuntimeError(
-                    f"native replay committed output drift before suffix for {state.request_id}"
-                )
+            elif position >= len(state.token_ids):
+                try:
+                    resolved_output, _ = resolved_output_prefix(
+                        state.output_token_ids
+                    )
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"native replay malformed output placeholders for "
+                        f"{state.request_id}"
+                    ) from exc
+                forced_width = min(len(resolved_output), len(state.token_ids))
+                if resolved_output[:forced_width] != state.token_ids[:forced_width]:
+                    raise RuntimeError(
+                        f"native replay committed output drift before suffix for "
+                        f"{state.request_id}"
+                    )
             state.sampled_token_ids.append(int(sampled[request_index].item()))
         return sampled

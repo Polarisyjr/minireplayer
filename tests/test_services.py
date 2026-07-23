@@ -105,7 +105,8 @@ def test_source_live_actor_can_stop_at_its_own_cutoff(tmp_path: Path) -> None:
     )
 
     assert service.expected_complete() is False  # actor b still has native work
-    assert service.cutoff_actor_complete("a") is True
+    assert service.cutoff_actor_complete("a") is False
+    assert service.cutoff_actor_prefix_consumed("a") is True
     with pytest.raises(WorkloadComplete):
         service.boundary.start(start_tool("a", "extra"))
 
