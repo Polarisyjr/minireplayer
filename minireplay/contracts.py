@@ -1,0 +1,88 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+_TYPED_PATH_FIELDS = {
+    "mini-swe": frozenset({"cwd"}),
+    "trae": frozenset({"path", "file_path", "cwd"}),
+    "coral": frozenset(
+        {"filePath", "filepath", "outputPath", "file", "path", "dir", "cwd", "physical_path"}
+    ),
+    "owl": frozenset({"path", "file_path", "cwd", "physical_path"}),
+}
+
+
+def bind_deployment_path(value: str, mapping: dict[str, str]) -> str:
+    """Normalize one field explicitly declared to contain a path."""
+
+    for physical, logical in sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True):
+        physical = physical.rstrip("/")
+        logical = logical.rstrip("/")
+        if value == physical:
+            return logical
+        if value.startswith(f"{physical}/"):
+            return f"{logical}{value[len(physical) :]}"
+    return value
+
+
+LOGICAL_RUN = "/native-run"
+LOGICAL_REPO = "/native-repo"
+
+
+def run_path_map(run_root: Path, repo: Path) -> dict[str, str]:
+    """Physical directories of this run, mapped to run-independent names.
+
+    A recorded tool argument names the directory the recording ran in. Comparing
+    that verbatim against a replay in a different directory would reject a correct
+    replay, so both sides are reduced to these logical names before comparison and
+    expanded back to the live directories before the call is made.
+
+    Longest path first, so a nested directory wins over its parent.
+    """
+
+    return {
+        str((run_root / "workspace").resolve()): "/native-workspace",
+        str(run_root.resolve()): LOGICAL_RUN,
+        str(repo.resolve()): LOGICAL_REPO,
+    }
+
+
+def to_physical(adapter: str, value: Any, run_root: Path, repo: Path) -> Any:
+    """Expand logical names back into this run's directories."""
+
+    deployment = {
+        "/native-workspace": str((run_root / "workspace").resolve()),
+        LOGICAL_RUN: str(run_root.resolve()),
+        LOGICAL_REPO: str(repo.resolve()),
+    }
+    return bind_typed_fields(adapter, value, deployment)
+
+
+def bind_typed_fields(adapter: str, value: Any, path_map: dict[str, str]) -> Any:
+    declared = _TYPED_PATH_FIELDS[adapter]
+
+    def visit(item: Any, field: str | None = None) -> Any:
+        if isinstance(item, dict):
+            return {key: visit(child, str(key)) for key, child in item.items()}
+        if isinstance(item, list):
+            return [visit(child, field) for child in item]
+        if isinstance(item, str) and field in declared:
+            return bind_deployment_path(item, path_map)
+        return item
+
+    return visit(value)
+
+
+def rebind_typed_fields(
+    adapter: str,
+    value: Any,
+    source_path_map: dict[str, str],
+    run_root: Path,
+) -> Any:
+    logical = bind_typed_fields(adapter, value, source_path_map)
+    deployment = {
+        "/native-workspace": str((run_root / "workspace").resolve()),
+        "/native-run": str(run_root.resolve()),
+    }
+    return bind_typed_fields(adapter, logical, deployment)

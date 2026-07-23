@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+results/
+
+# Local one-shot repository bootstrap instructions supplied by the owner.
+git
