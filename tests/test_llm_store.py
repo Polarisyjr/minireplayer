@@ -68,7 +68,10 @@ def test_rejects_api_drift(tmp_path: Path) -> None:
 def test_rejects_a_structurally_different_request(tmp_path: Path) -> None:
     store_ = store(tmp_path, [llm()])
     changed = {"model": "m", "messages": [{"role": "system", "content": "hi"}]}
-    with pytest.raises(MismatchError, match="request drift"):
+    with pytest.raises(
+        MismatchError,
+        match=r"first difference: \$\.payload\.messages\[0\]\.role",
+    ):
         store_._claim(identity(), changed, "chat.completions")
 
 
@@ -175,3 +178,43 @@ def test_inline_image_payloads_do_not_carry_a_size_class() -> None:
     dropped = request(39_266)
     dropped["messages"][0]["content"].pop(0)
     assert request_shape(dropped) != request_shape(small)
+
+
+def test_claim_tolerates_live_multimodal_history_eviction(tmp_path: Path) -> None:
+    """Fresh screenshot cost may change retained history, not the current turn."""
+
+    inline_turn = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "act on the current browser viewport"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,AAAA"},
+            },
+        ],
+    }
+    recorded = {
+        "model": "vision",
+        "messages": [
+            {"role": "system", "content": "browse safely"},
+            {"role": "assistant", "content": "older action"},
+            inline_turn,
+            {"role": "assistant", "content": "most recent action"},
+        ],
+        "max_tokens": 4096,
+    }
+    observed = {
+        "model": "vision",
+        "messages": [
+            {"role": "system", "content": "browse safely"},
+            inline_turn,
+        ],
+        "max_tokens": 4096,
+    }
+    store_ = store(tmp_path, [llm(request=recorded, role="browser_web")])
+
+    claimed = store_._claim(
+        identity(role="browser_web"), observed, "chat.completions"
+    )
+
+    assert claimed["attempt_id"] == "llm-0"

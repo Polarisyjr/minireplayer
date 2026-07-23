@@ -293,11 +293,30 @@ class LLMStore:
                 f"LLM API drift for {key} at sequence {sequence}: "
                 f"expected={expected['api']} actual={api}"
             )
-        observed = sha256_json(request_shape(body))
-        if observed != expected["request_shape_sha256"]:
+        observed_shape = request_shape(body)
+        observed = sha256_json(observed_shape)
+        expected_live_shape = _live_multimodal_request_shape(expected["request"])
+        observed_live_shape = _live_multimodal_request_shape(body)
+        live_multimodal_match = (
+            expected_live_shape is not None
+            and observed_live_shape is not None
+            and expected_live_shape == observed_live_shape
+        )
+        if observed != expected["request_shape_sha256"] and not live_multimodal_match:
+            expected_shape = request_shape(expected["request"])
+            difference = _first_shape_difference(expected_shape, observed_shape)
+            if expected_live_shape is not None and observed_live_shape is not None:
+                live_difference = _first_shape_difference(
+                    expected_live_shape, observed_live_shape
+                )
+                difference = (
+                    f"{difference or 'shape hashes differ'}; "
+                    f"live multimodal projection: {live_difference or 'matched'}"
+                )
             raise MismatchError(
                 f"LLM request drift for {key} at sequence {sequence}: "
-                f"the framework built a structurally different request"
+                "the framework built a structurally different request; "
+                f"first difference: {difference or 'shape hashes differ'}"
             )
         self._replay_sequence[key] = sequence + 1
         return expected
@@ -936,3 +955,100 @@ def _shape(value: Any, field: str | None = None) -> Any:
             return _inline_data_shape(value)
         return {"kind": "text", "size_bucket": _size_bucket(value)}
     return value
+
+
+def _live_multimodal_request_shape(body: dict[str, Any]) -> dict[str, Any] | None:
+    """Project a live inline-media request without context-eviction history.
+
+    A framework may trim earlier chat turns before its HTTP request according to
+    the token cost of a fresh screenshot. That cost is a browser internal and can
+    select a different amount of assistant history even when the current
+    multimodal turn and fixed control flow are unchanged. Preserve the system
+    contract, latest inline-media message, other payloads, and all configuration;
+    only the variable retained history around that turn is omitted.
+    """
+
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return None
+    inline_messages = [
+        message
+        for message in messages
+        if isinstance(message, dict) and _contains_inline_data(message.get("content"))
+    ]
+    if not inline_messages:
+        return None
+    system_messages = [
+        message
+        for message in messages
+        if isinstance(message, dict) and message.get("role") == "system"
+    ]
+    other_payload = {
+        key: _shape(value)
+        for key, value in body.items()
+        if key in {"input", "prompt"}
+    }
+    return {
+        "payload": {
+            **other_payload,
+            "messages": {
+                "system": [_shape(message) for message in system_messages],
+                "latest_inline": _shape(inline_messages[-1]),
+            },
+        },
+        "configuration": {
+            key: value
+            for key, value in body.items()
+            if key not in {"messages", "input", "prompt"}
+        },
+    }
+
+
+def _contains_inline_data(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.startswith("data:")
+    if isinstance(value, dict):
+        return any(_contains_inline_data(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_inline_data(child) for child in value)
+    return False
+
+
+def _first_shape_difference(expected: Any, observed: Any, path: str = "$") -> str | None:
+    """Describe the first structural request difference without exposing prompt text."""
+
+    if type(expected) is not type(observed):
+        return (
+            f"{path}: expected type {type(expected).__name__}, "
+            f"observed {type(observed).__name__}"
+        )
+    if isinstance(expected, dict):
+        expected_keys = set(expected)
+        observed_keys = set(observed)
+        if expected_keys != observed_keys:
+            return (
+                f"{path}: expected keys {sorted(expected_keys)!r}, "
+                f"observed {sorted(observed_keys)!r}"
+            )
+        for key in sorted(expected):
+            difference = _first_shape_difference(
+                expected[key], observed[key], f"{path}.{key}"
+            )
+            if difference is not None:
+                return difference
+        return None
+    if isinstance(expected, list):
+        if len(expected) != len(observed):
+            return f"{path}: expected length {len(expected)}, observed {len(observed)}"
+        for index, (expected_item, observed_item) in enumerate(
+            zip(expected, observed, strict=True)
+        ):
+            difference = _first_shape_difference(
+                expected_item, observed_item, f"{path}[{index}]"
+            )
+            if difference is not None:
+                return difference
+        return None
+    if expected != observed:
+        return f"{path}: expected {expected!r}, observed {observed!r}"
+    return None

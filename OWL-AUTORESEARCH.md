@@ -498,3 +498,56 @@ P95 absolute delta=5.803s，最大 absolute delta=11.825s。最大项来自 acto
 `e8cb5b03-...`：Replay 1 的 document extraction/native fetch 明显更慢；反向较大的
 `0ff53813-...` 则是 Replay 2 的第二组 document extraction 约 15.8s，体现真实 native
 network/document 路径的缓存与服务方波动。尽管单 lane 有移动，batch spread 仅 0.8%。
+
+### E12 — refill=true 的 Owl C1/C8/C32 / 180s
+
+按统一配置重新验证 refill 路径：`duration_s=180`、预热 20s、seed=42，每个并行度录制
+一次并进行两次 full replay。所有新产物均写入
+`results/owl-refill-180s-20260723/`，没有写入旧的
+`results/owl-autoresearch-20260723/`。C1/C8/C32 的初始并行度分别为 1/8/32；
+refill 后实际 actor lane 分别为 2/13/43。
+
+| 并行度 | actor（初始+refill） | 固定前缀（LLM/dispatch/tool） | Record makespan / busy | Replay 1 | Replay 2 | 两次 replay spread |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| C1 | 2（1+1） | 54 / 19 / 46 | 173.591s / 171.689s | 170.297s | 171.915s | 1.618s（0.95%） |
+| C8 | 13（8+5） | 275 / 90 / 232 | 173.796s / 173.315s | 174.212s | 175.757s | 1.545s（0.88%） |
+| C32 | 43（32+11） | 733 / 281 / 639 | 172.043s / 171.885s | 170.914s | 169.678s | 1.236s（0.72%） |
+
+三份报告 `c1-report.json`、`c8-report.json`、`c32-report.json` 均为 valid 且
+`reasons=[]`。两次 replay 都完整消费对应 fixed prefix，replay cutoff tails 均为空。
+每个正式 replay 的 forced audit 条数与 LLM 固定槽位严格相等（54/275/733），全部为
+`force/complete`，expected sampled token count 与实际 sampler count 一致。Record
+在 180s 边界保留 evidence-only tails：C1 为 1 LLM，C8 为 5 LLM + 3 operation，
+C32 为 26 LLM + 8 operation；这些 tail 均未在 replay 中执行。
+
+每个并行度的 Record + 2 Replay 对比图及逐 lane 数据分别位于
+`c1-comparison/`、`c8-comparison/`、`c32-comparison/`：
+
+- `cN-refill-180s-batch-and-per-lane-wallclock.{png,svg}`
+- `cN-refill-180s-full-chain-lanes-timeline.{png,svg}`
+- `cN-refill-180s-per-lane.{json,csv}`
+
+#### C32 首次 replay 漂移的根因与修复
+
+C32 的前三次 replay1 尝试被保留为 `c32-replay1`、`c32-replay1-r2` 和
+`c32-replay1-r3`。前两次都在同一个 `browser_web` actor 的第 3 个 LLM 请求稳定触发
+request drift。新增安全结构诊断后，第三次将差异定位为
+`$.payload.messages: expected length 5, observed 2`；诊断只报告结构路径、类型和长度，
+不输出 prompt 内容。
+
+漂移前的 Owl browser actions、参数和 causal lane 在 source/replay 中完全一致。差异来自
+live Chromium 的新截图：截图 token cost 会影响 CAMEL 的上下文裁剪，使同一当前
+多模态 turn 周围保留的旧 assistant history 数量不同。原有 request-shape 校验把这个
+可变历史长度误判成控制流漂移；这不是 fixed prefix、工具调用或 lane identity 的差异。
+
+`minireplay/llm_store.py` 新增 `_live_multimodal_request_shape`：仅对含 inline `data:`
+media 的请求建立受限投影，严格保留 system contract、最新 inline multimodal turn、
+`input`/`prompt` payload 以及全部配置和 sampling 字段，只忽略会随新截图 token cost
+变化的外围 retained chat history。普通文本请求仍使用原有严格 request-shape 校验；
+多模态请求的当前 turn、媒体 MIME/结构或配置一旦变化也仍会 fail closed。另新增
+`_first_shape_difference` 作为不泄露 prompt 的首差异诊断，并补充结构漂移与
+live multimodal history eviction 回归测试。
+
+修复后 `c32-replay1-r4` 与 `c32-replay2` 均一次完整通过：各消费 733 LLM +
+281 dispatch + 639 native tool，报告 valid，无 replay tail；两次 makespan 之差仅
+-1.236s（Replay 2 相对 Replay 1 为 -0.72%）。最终门禁为 ruff clean、`147 passed`。
