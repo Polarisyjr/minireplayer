@@ -551,3 +551,82 @@ live multimodal history eviction 回归测试。
 修复后 `c32-replay1-r4` 与 `c32-replay2` 均一次完整通过：各消费 733 LLM +
 281 dispatch + 639 native tool，报告 valid，无 replay tail；两次 makespan 之差仅
 -1.236s（Replay 2 相对 Replay 1 为 -0.72%）。最终门禁为 ruff clean、`147 passed`。
+
+### E13 — 稳定 task-id refill lane 的 Owl C1/C8/C32 / 300s
+
+本轮将正式采样窗口扩大到 300s，预热仍为 20s，但预热并行度不再固定：
+C1/C8/C32 分别使用 1/8/32 个并发预热请求。配置统一为 seed=42、`refill=true`，
+每个并行度录制一次并执行两次 full replay。最终产物全部写入
+`results/owl-refill-taskid-300s-20260723/`；调试阶段的失败 replay 已删除，上一版
+`results/owl-refill-lanes-300s-20260723/` 仅作为问题定位证据，没有混入最终报告。
+
+Owl 配置同时为所有 VL role 设置了显式输出上限：
+`browser_web`、`image`、`video` 均为 `extra_config.max_tokens=4096`。这限制的是模型
+输出长度，不裁剪输入截图或消息历史；目的是避免 missed EOS 后一直生成到 131k context
+或 client timeout，使一条 steady-concurrency lane 长时间被占住。
+
+| 并行度 | 因果 lane / 实际 task-id | 固定前缀（LLM/dispatch/tool） | Record makespan / busy | Replay 1 | Replay 2 | Replay 2−1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| C1 | 1 / 3 | 78 / 29 / 63 | 292.715s / 288.285s | 281.779s | 287.333s | +5.554s（+1.971%） |
+| C8 | 8 / 12 | 340 / 94 / 318 | 293.110s / 292.605s | 303.445s | 297.952s | -5.493s（-1.810%） |
+| C32 | 32 / 48 | 956 / 331 / 825 | 292.296s / 290.017s | 289.667s | 287.775s | -1.892s（-0.653%） |
+
+三份 `cN-report.json` 均为 `valid=true` 且 `reasons=[]`；六次 replay 都以
+`fixed-work-complete` 结束，固定事件数逐项相等，timeline 的 internal/unattributed
+gap 均为 0。每次 replay 的 forced audit 数量与 LLM 槽位严格相等：
+C1 为 78/78、C8 为 340/340、C32 为 956/956，全部为 `force/complete`，且
+`expected_sampled_token_count == sampled_token_count`。Record 的 evidence-only
+cutoff tail 分别为 C1 1 LLM、C8 7 LLM、C32 31 LLM + 1 operation；tail 没有进入
+fixed replay。
+
+最终图和逐 lane 数据位于每个 `cN-comparison/`：
+
+- `cN-refill-taskid-300s-batch-and-per-lane-wallclock.{png,svg}`
+- `cN-refill-taskid-300s-full-chain-lanes-timeline.{png,svg}`
+- `cN-refill-taskid-300s-per-lane.{json,csv}`
+
+图中 C1/C8/C32 始终只有 1/8/32 行。一个 lane 内可以连续包含多个真实 task-id，
+refill 不再以新 actor 行出现；source cutoff tail 只在 record 面板用斜线表示。
+
+#### `document` 第 7 个请求的 16K/64K drift
+
+C32 调试录制中，一个 document extraction 把页面拆为 8 个 chunk，并发请求
+`document` LLM：7 个完整请求的 message 文本约 40,435 字符，尾 chunk 约 5,293
+字符。request-shape 的字符串桶以 4 倍递增，因此两者分别落入 `1-65536` 与
+`1-16384`。
+
+`sequence=6` 只是请求到达代理的顺序，不是文档的逻辑 chunk 编号。录制时第 7 个到达的
+恰好是短尾段，replay 时第 7 个到达的是完整段，严格的逐序号 shape 校验因此把并发乱序
+误报成内容 drift。这不涉及截图 token，也不代表 replay 会采用新的模型输出。
+
+`_live_document_request_shape` 只对 Owl `document` role 且含明确
+`<document_part>...</document_part>` 分隔符的请求生效：比较时替换分隔符内部的 live
+chunk 正文，但保留消息数量和角色、prompt 模板、query、模型、`max_tokens` 和其他采样
+配置。query、结构或配置改变仍会 fail closed。模型执行仍使用 bundle 中的原始录制请求
+和强制 token，Owl 收到的也仍是录制响应。
+
+#### refill lane 真正的身份与串行问题
+
+上一版将第 N 次额外提交命名为 `refill-0000NN`。这个编号依赖全局完成/提交时序：
+C32 的 native tool 和网络时延稍有变化，就可能使录制时的“第 37 个 refill”与 replay
+时的“第 37 个 refill”成为两个不同 GAIA task。旧实现虽然把该 alias 映射到录制 actor，
+却可能把任务 B 放进任务 A 的 LLM/tool 队列，表现为原 task 尚应发送 4-message 续轮时，
+另一个 task 的 2-message 初始请求提前出现。
+
+身份映射本身也不足以保持 lane 语义：`ProcessPoolExecutor` 可把 refill 分给任意空闲
+进程，因此同一录制 actor 的前一任务还没结束时，另一个进程可能已经开始其 refill，
+两者会并发消费同一逻辑 lane。
+
+最终修复包含两部分：
+
+1. pool path 的每次提交（包括 refill）始终使用 GAIA 自带的稳定 `task_id`。Record
+   持久化真实 `task_id -> 首次执行它的 worker lane`；Replay 按 task-id 恢复该 lane，
+   不再依赖完成顺序。最终 manifest 中 synthetic `refill-N` 数为 0。
+2. `gated_terminal_callable` 为解析后的 actor 获取 run-local 跨进程 advisory lock。
+   refill 即使落到另一个 runtime worker，也必须等同一因果 lane 的前项任务 terminal
+   后才可执行；不同 actor 的锁互不阻塞。
+
+调试中还有一次 `native replay request ID reused`：删除失败目录后用相同 run-id 重试，
+共享 vLLM audit 已见过相同 forced request ID，插件按 fail-closed 设计终止该 engine。
+这不是 workload drift；重启 fleet 并为重试使用新的 audit namespace 后消失。最终六次
+replay 的 run-id 均唯一。

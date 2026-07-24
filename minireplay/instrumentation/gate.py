@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import re
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +110,34 @@ def target_for_actor(actor_id: str) -> str:
     if not isinstance(target, str) or not target:
         raise InfrastructureError(f"invalid LLM target for {actor_id}: {target!r}")
     return target
+
+
+@contextlib.contextmanager
+def _causal_lane_lock(
+    actor_id: str,
+    native_lane_key: str | None,
+) -> Iterator[None]:
+    """Keep refill tasks for one recorded lane sequential across pool workers.
+
+    Replay restores a refill task's recorded actor even when ``ProcessPoolExecutor``
+    assigns it to a different runtime worker. The earlier task for that actor may
+    still be running there, so identity mapping alone is insufficient: both tasks
+    would consume one LLM/tool lane concurrently. A run-local advisory lock makes
+    the causal lane serial without requiring process affinity from Owl's scheduler.
+    """
+
+    root = os.environ.get("NATIVE_REPLAY_LANE_BINDING_DIR")
+    if native_lane_key is None or not root:
+        yield
+        return
+    lock_dir = Path(root) / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with (lock_dir / f"{actor_id}.lock").open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def bind_task_lane(source_actor_id: str, native_lane_key: str | None = None) -> str:
@@ -241,23 +272,40 @@ def gated_callable(function, source_actor_id: str, process_role: str, args, kwar
         reset_context(tokens)
 
 
-def gated_terminal_callable(function, source_actor_id: str, process_role: str, args, kwargs):
-    tokens = ready_and_wait(source_actor_id, process_role=process_role)
-    previous = _export_context()
+def gated_terminal_callable(
+    function,
+    source_actor_id: str,
+    process_role: str,
+    args,
+    kwargs,
+    native_lane_key: str | None = None,
+):
+    tokens = ready_and_wait(
+        source_actor_id,
+        native_lane_key=native_lane_key,
+        process_role=process_role,
+    )
     try:
-        result = function(*args, **kwargs)
-        successful = not (isinstance(result, tuple) and len(result) >= 2 and result[1] != "ok")
-        report_task_terminal(
-            result=result,
-            status="success" if successful else "failure",
-        )
-        return result
-    except Exception as exc:
-        report_task_terminal(
-            status="failure",
-            result={"error_type": type(exc).__name__, "message": str(exc)},
-        )
-        raise
+        actor_id = str(current_context()["actor_id"])
+        with _causal_lane_lock(actor_id, native_lane_key):
+            previous = _export_context()
+            try:
+                result = function(*args, **kwargs)
+                successful = not (
+                    isinstance(result, tuple) and len(result) >= 2 and result[1] != "ok"
+                )
+                report_task_terminal(
+                    result=result,
+                    status="success" if successful else "failure",
+                )
+                return result
+            except Exception as exc:
+                report_task_terminal(
+                    status="failure",
+                    result={"error_type": type(exc).__name__, "message": str(exc)},
+                )
+                raise
+            finally:
+                _restore_environment(previous)
     finally:
-        _restore_environment(previous)
         reset_context(tokens)

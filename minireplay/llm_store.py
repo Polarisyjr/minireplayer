@@ -302,7 +302,24 @@ class LLMStore:
             and observed_live_shape is not None
             and expected_live_shape == observed_live_shape
         )
-        if observed != expected["request_shape_sha256"] and not live_multimodal_match:
+        expected_document_shape = (
+            _live_document_request_shape(expected["request"])
+            if identity.role == "document"
+            else None
+        )
+        observed_document_shape = (
+            _live_document_request_shape(body) if identity.role == "document" else None
+        )
+        live_document_match = (
+            expected_document_shape is not None
+            and observed_document_shape is not None
+            and expected_document_shape == observed_document_shape
+        )
+        if (
+            observed != expected["request_shape_sha256"]
+            and not live_multimodal_match
+            and not live_document_match
+        ):
             expected_shape = request_shape(expected["request"])
             difference = _first_shape_difference(expected_shape, observed_shape)
             if expected_live_shape is not None and observed_live_shape is not None:
@@ -312,6 +329,14 @@ class LLMStore:
                 difference = (
                     f"{difference or 'shape hashes differ'}; "
                     f"live multimodal projection: {live_difference or 'matched'}"
+                )
+            if expected_document_shape is not None and observed_document_shape is not None:
+                document_difference = _first_shape_difference(
+                    expected_document_shape, observed_document_shape
+                )
+                difference = (
+                    f"{difference or 'shape hashes differ'}; "
+                    f"live document projection: {document_difference or 'matched'}"
                 )
             raise MismatchError(
                 f"LLM request drift for {key} at sequence {sequence}: "
@@ -1012,6 +1037,50 @@ def _contains_inline_data(value: Any) -> bool:
     if isinstance(value, list):
         return any(_contains_inline_data(child) for child in value)
     return False
+
+
+def _live_document_request_shape(body: dict[str, Any]) -> dict[str, Any] | None:
+    """Project Owl's live document chunk without its fetched body.
+
+    ``extract_document_content`` fetches a document natively during replay, then
+    checks its chunks concurrently with the ``document`` LLM role. Chunk requests
+    can therefore reach the proxy in a different order, and live pages can change
+    their byte length, even though the enclosing recorded tool observation is
+    restored before Owl continues. Keep the prompt template, query, message
+    structure, and model configuration strict; only replace text between Owl's
+    explicit ``document_part`` delimiters.
+    """
+
+    found = False
+
+    def redact(value: Any) -> Any:
+        nonlocal found
+        if isinstance(value, dict):
+            return {key: redact(child) for key, child in value.items()}
+        if isinstance(value, list):
+            return [redact(child) for child in value]
+        if not isinstance(value, str):
+            return value
+        opening = "<document_part>"
+        closing = "</document_part>"
+        start = value.find(opening)
+        if start < 0:
+            return value
+        end = value.find(closing, start + len(opening))
+        if end < 0:
+            return value
+        found = True
+        return (
+            value[: start + len(opening)]
+            + "\n<live-document-chunk>\n"
+            + value[end:]
+        )
+
+    projected = redact(body)
+    if not found:
+        return None
+    assert isinstance(projected, dict)
+    return request_shape(projected)
 
 
 def _first_shape_difference(expected: Any, observed: Any, path: str = "$") -> str | None:

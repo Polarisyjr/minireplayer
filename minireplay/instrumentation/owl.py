@@ -588,13 +588,12 @@ def _submit_factory(original):
         task = args[0]
         if not isinstance(task, dict) or "task_id" not in task:
             raise RuntimeError("Owl native task submission has no task_id")
-        submission = next(_TASK_SUBMISSIONS)
-        concurrency = int(os.environ.get("NATIVE_REPLAY_CONCURRENCY", "1"))
-        source_actor = (
-            str(task["task_id"])
-            if submission < concurrency
-            else f"refill-{submission:06d}"
-        )
+        # Completion order changes slightly between record and replay, so a
+        # global refill submission number does not identify the same GAIA task.
+        # The dataset task_id does: record binds every real task to the process
+        # lane that ran it, and replay resolves that task back to the recorded
+        # lane regardless of which runtime worker becomes free first.
+        source_actor = str(task["task_id"])
         return original(
             self,
             gated_terminal_callable,
@@ -603,6 +602,7 @@ def _submit_factory(original):
             "owl-task",
             args,
             kwargs,
+            "process-worker",
         )
 
     return wrapped
@@ -661,6 +661,7 @@ def _serial_workforce_factory(original):
             "owl-task",
             (self, *args),
             kwargs,
+            "serial-worker",
         )
 
     return wrapped
