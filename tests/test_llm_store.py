@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 
 import pytest
 
+from minireplay import llm_store
 from minireplay.errors import MismatchError, WorkloadComplete
 from minireplay.llm_store import LLMStore, RequestIdentity, request_shape
 from minireplay.util import sha256_json
@@ -142,6 +145,313 @@ def test_model_call_index_links_a_dispatch_to_its_attempt(tmp_path: Path) -> Non
     assert store_.attempt_for_model_call("call_unknown") is None
 
 
+def test_stream_indexes_tool_call_before_framework_can_dispatch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store_ = LLMStore(
+        mode="record",
+        stage_dir=tmp_path,
+        upstreams={"vllm-8000": "http://127.0.0.1:8000"},
+    )
+    attempt_id = "llm-stream"
+    payload = {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {"id": "call_stream", "type": "function", "function": {"name": "read"}}
+                    ]
+                }
+            }
+        ]
+    }
+    wire = (f"data: {json.dumps(payload, separators=(',', ':'))}\n\ndata: [DONE]\n\n").encode()
+
+    class Content:
+        async def iter_any(self):
+            yield wire
+
+    class Upstream:
+        status = 200
+        content = Content()
+
+    class Response:
+        async def prepare(self, _request):
+            pass
+
+        async def write(self, data):
+            if b"call_stream" in data:
+                assert store_.attempt_for_model_call("call_stream") == attempt_id
+
+        async def write_eof(self):
+            pass
+
+    monkeypatch.setattr(
+        llm_store.web,
+        "StreamResponse",
+        lambda **_kwargs: Response(),
+    )
+
+    async def capture_engine(observed_attempt_id, committed):
+        assert observed_attempt_id == attempt_id
+        assert committed == []
+        return {"capture": "complete"}
+
+    monkeypatch.setattr(store_, "_capture_engine", capture_engine)
+    asyncio.run(
+        store_._record_stream(
+            object(),
+            Upstream(),
+            identity(),
+            BODY,
+            "chat.completions",
+            attempt_id,
+            0,
+            100,
+        )
+    )
+    written = json.loads((tmp_path / "llm.jsonl").read_text().strip())
+    assert written["engine"] == {"capture": "complete"}
+
+
+def test_completed_record_stream_tolerates_client_close_before_http_eof(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store_ = LLMStore(
+        mode="record",
+        stage_dir=tmp_path,
+        upstreams={"vllm-8000": "http://127.0.0.1:8000"},
+    )
+
+    class Content:
+        async def iter_any(self):
+            yield b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+
+    class Upstream:
+        status = 200
+        content = Content()
+
+    class Response:
+        async def prepare(self, _request):
+            pass
+
+        async def write(self, _data):
+            pass
+
+        async def write_eof(self):
+            raise ConnectionResetError("Cannot write to closing transport")
+
+    monkeypatch.setattr(llm_store.web, "StreamResponse", lambda **_kwargs: Response())
+
+    async def capture_engine(_attempt_id, _committed):
+        return {"capture": "complete"}
+
+    monkeypatch.setattr(store_, "_capture_engine", capture_engine)
+    asyncio.run(
+        store_._record_stream(
+            object(),
+            Upstream(),
+            identity(),
+            BODY,
+            "chat.completions",
+            "llm-complete-reset",
+            0,
+            100,
+        )
+    )
+
+    written = json.loads((tmp_path / "llm.jsonl").read_text().strip())
+    assert written["attempt_id"] == "llm-complete-reset"
+
+
+def test_terminal_payload_tolerates_client_close_before_done_marker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store_ = LLMStore(
+        mode="record",
+        stage_dir=tmp_path,
+        upstreams={"vllm-8000": "http://127.0.0.1:8000"},
+    )
+    terminal = {
+        "choices": [
+            {
+                "delta": {},
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+
+    class Content:
+        async def iter_any(self):
+            yield (
+                f"data: {json.dumps(terminal, separators=(',', ':'))}\n\ndata: [DONE]\n\n"
+            ).encode()
+
+    class Upstream:
+        status = 200
+        content = Content()
+
+    class Response:
+        async def prepare(self, _request):
+            pass
+
+        async def write(self, data):
+            if b"[DONE]" in data:
+                raise ConnectionResetError("Cannot write to closing transport")
+
+        async def write_eof(self):
+            raise ConnectionResetError("Cannot write to closing transport")
+
+    monkeypatch.setattr(llm_store.web, "StreamResponse", lambda **_kwargs: Response())
+
+    async def capture_engine(_attempt_id, _committed):
+        return {"capture": "complete"}
+
+    monkeypatch.setattr(store_, "_capture_engine", capture_engine)
+    asyncio.run(
+        store_._record_stream(
+            object(),
+            Upstream(),
+            identity(),
+            BODY,
+            "chat.completions",
+            "llm-terminal-reset",
+            0,
+            100,
+        )
+    )
+
+    written = json.loads((tmp_path / "llm.jsonl").read_text().strip())
+    assert written["response"]["chunks"] == [{"done": False, "payload": terminal}]
+
+
+def test_incomplete_record_stream_becomes_a_cutoff_tail_on_client_close(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store_ = LLMStore(
+        mode="record",
+        stage_dir=tmp_path,
+        upstreams={"vllm-8000": "http://127.0.0.1:8000"},
+    )
+
+    class Content:
+        async def iter_any(self):
+            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+
+    class Upstream:
+        status = 200
+        content = Content()
+
+    class Response:
+        async def prepare(self, _request):
+            pass
+
+        async def write(self, _data):
+            pass
+
+        async def write_eof(self):
+            raise ConnectionResetError("Cannot write to closing transport")
+
+    monkeypatch.setattr(llm_store.web, "StreamResponse", lambda **_kwargs: Response())
+    attempt_id = "llm-partial-reset"
+    store_._inflight[attempt_id] = {
+        "attempt_id": attempt_id,
+        "actor_id": "actor-0",
+        "started_at_ns": 100,
+    }
+
+    asyncio.run(
+        store_._record_stream(
+            object(),
+            Upstream(),
+            identity(),
+            BODY,
+            "chat.completions",
+            attempt_id,
+            0,
+            100,
+        )
+    )
+
+    assert not (tmp_path / "llm.jsonl").exists()
+    tail = store_.freeze_source_cutoff(10**30)[0]
+    assert tail["attempt_id"] == attempt_id
+    assert tail["interruption"] == "client-disconnected-before-terminal"
+    assert tail["partial_response"]["chunks"][0]["payload"]["choices"][0]["delta"] == {
+        "content": "partial"
+    }
+    assert tail["elapsed_ns"] == tail["interrupted_at_ns"] - 100
+
+
+def test_full_replay_drains_forced_stream_without_decoding_it_as_json(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store_ = store(tmp_path, [])
+    store_.force_secret = "secret"
+    store_.audit_namespace = "run"
+    expected_engine = {
+        "committed_sample_start": 0,
+        "sampled_token_count": 1,
+    }
+    expected = {
+        "attempt_id": "llm-stream",
+        "request": {"model": "m", "stream": True},
+        "stream": True,
+        "status_code": 200,
+        "prompt_token_ids": [1],
+        "response_token_ids": [2],
+        "engine": expected_engine,
+    }
+    drained: list[bytes] = []
+
+    class Content:
+        async def iter_any(self):
+            for value in (b"data: first\n\n", b"data: [DONE]\n\n"):
+                drained.append(value)
+                yield value
+
+    class Upstream:
+        status = 200
+        content = Content()
+
+        async def json(self):
+            raise AssertionError("a forced SSE response must not be decoded as JSON")
+
+    class Post:
+        async def __aenter__(self):
+            return Upstream()
+
+        async def __aexit__(self, *_args):
+            pass
+
+    class Client:
+        def post(self, *_args, **_kwargs):
+            return Post()
+
+    class Audit:
+        async def wait(self, *_args, **_kwargs):
+            return {"audit": "complete"}
+
+    store_.client = Client()
+    store_.audit = Audit()
+    monkeypatch.setattr(llm_store, "forced_upstream_body", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        llm_store,
+        "engine_evidence",
+        lambda _record, _committed: expected_engine,
+    )
+
+    asyncio.run(
+        store_._run_upstream(
+            identity(),
+            "chat.completions",
+            expected,
+        )
+    )
+
+    assert drained == [b"data: first\n\n", b"data: [DONE]\n\n"]
+
+
 def test_inline_image_payloads_do_not_carry_a_size_class() -> None:
     """A live screenshot's byte length must not decide whether a replay is valid.
 
@@ -213,8 +523,6 @@ def test_claim_tolerates_live_multimodal_history_eviction(tmp_path: Path) -> Non
     }
     store_ = store(tmp_path, [llm(request=recorded, role="browser_web")])
 
-    claimed = store_._claim(
-        identity(role="browser_web"), observed, "chat.completions"
-    )
+    claimed = store_._claim(identity(role="browser_web"), observed, "chat.completions")
 
     assert claimed["attempt_id"] == "llm-0"

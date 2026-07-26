@@ -147,6 +147,20 @@ def collect_token_fields(value: Any) -> dict[str, list[int]]:
     return {"prompt_token_ids": prompt, "response_token_ids": output}
 
 
+def stream_payload_is_terminal(api: str, payload: dict[str, Any]) -> bool:
+    if api == "chat.completions":
+        choices = payload.get("choices")
+        return isinstance(choices, list) and any(
+            isinstance(choice, dict) and choice.get("finish_reason") is not None
+            for choice in choices
+        )
+    return payload.get("type") in {
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
+    }
+
+
 class LLMStore:
     def __init__(
         self,
@@ -172,9 +186,7 @@ class LLMStore:
         # this reader at the current EOF so this LLM store only consumes evidence
         # produced for its own run; request IDs provide the second isolation layer.
         self.audit = (
-            ForcedAuditReader(audit_path, start_at_end=True)
-            if audit_path is not None
-            else None
+            ForcedAuditReader(audit_path, start_at_end=True) if audit_path is not None else None
         )
         self.audit_namespace = audit_namespace
         self.hard_failure: str | None = None
@@ -323,9 +335,7 @@ class LLMStore:
             expected_shape = request_shape(expected["request"])
             difference = _first_shape_difference(expected_shape, observed_shape)
             if expected_live_shape is not None and observed_live_shape is not None:
-                live_difference = _first_shape_difference(
-                    expected_live_shape, observed_live_shape
-                )
+                live_difference = _first_shape_difference(expected_live_shape, observed_live_shape)
                 difference = (
                     f"{difference or 'shape hashes differ'}; "
                     f"live multimodal projection: {live_difference or 'matched'}"
@@ -509,31 +519,69 @@ class LLMStore:
                 "X-Native-Replay-Attempt": attempt_id,
             },
         )
-        await response.prepare(request)
         decoder = SSEDecoder()
         chunks: list[dict[str, Any]] = []
         tokens: dict[str, list[int]] = {"prompt_token_ids": [], "response_token_ids": []}
-        async for data in upstream.content.iter_any():
-            for event in decoder.feed(data):
-                payload = sse_payload(event)
-                if payload is None:
-                    continue
-                if payload == "[DONE]":
-                    chunks.append({"done": True})
-                    await response.write(encode_sse("[DONE]"))
-                    continue
-                parsed = json.loads(payload)
-                found = collect_token_fields(parsed)
-                tokens["response_token_ids"].extend(found["response_token_ids"])
-                if found["prompt_token_ids"] and not tokens["prompt_token_ids"]:
-                    tokens["prompt_token_ids"] = found["prompt_token_ids"]
-                clean = strip_token_fields(parsed)
-                chunks.append({"done": False, "payload": clean})
-                await response.write(encode_sse(json.dumps(clean, separators=(",", ":"))))
-        decoder.finish()
-        await response.write_eof()
+        stream_complete = False
+        try:
+            await response.prepare(request)
+            async for data in upstream.content.iter_any():
+                for event in decoder.feed(data):
+                    payload = sse_payload(event)
+                    if payload is None:
+                        continue
+                    if payload == "[DONE]":
+                        try:
+                            await response.write(encode_sse("[DONE]"))
+                        except ConnectionResetError:
+                            if not stream_complete:
+                                raise
+                        else:
+                            chunks.append({"done": True})
+                            stream_complete = True
+                        continue
+                    parsed = json.loads(payload)
+                    found = collect_token_fields(parsed)
+                    tokens["response_token_ids"].extend(found["response_token_ids"])
+                    if found["prompt_token_ids"] and not tokens["prompt_token_ids"]:
+                        tokens["prompt_token_ids"] = found["prompt_token_ids"]
+                    clean = strip_token_fields(parsed)
+                    # A streamed client can invoke a parsed tool immediately after it
+                    # receives the provider call ID. Publish the causal index before
+                    # the bytes become framework-visible, otherwise its dispatch can
+                    # race the post-EOF indexing below.
+                    self._index_model_calls(attempt_id, clean)
+                    await response.write(encode_sse(json.dumps(clean, separators=(",", ":"))))
+                    chunks.append({"done": False, "payload": clean})
+                    if stream_payload_is_terminal(api, clean):
+                        stream_complete = True
+            decoder.finish()
+            await response.write_eof()
+        except ConnectionResetError:
+            # SSE clients are allowed to close as soon as they consume [DONE].
+            # A reset before a terminal event is also expected when the native
+            # framework kills an invocation at its own cutoff. That request stays
+            # open as an LLM tail; it is never promoted to a completed slot.
+            if not stream_complete:
+                self._mark_stream_interrupted(
+                    attempt_id=attempt_id,
+                    chunks=chunks,
+                    tokens=tokens,
+                    reason="client-disconnected-before-terminal",
+                )
+                return response
+        if not stream_complete:
+            self._mark_stream_interrupted(
+                attempt_id=attempt_id,
+                chunks=chunks,
+                tokens=tokens,
+                reason="upstream-ended-before-terminal",
+            )
+            return response
         ended = monotonic_ns()
+        engine = await self._capture_engine(attempt_id, tokens["response_token_ids"])
         self._write_attempt(
+            engine=engine,
             attempt_id=attempt_id,
             identity=identity,
             sequence=sequence,
@@ -546,10 +594,28 @@ class LLMStore:
             started=started,
             ended=ended,
         )
-        for chunk in chunks:
-            if not chunk["done"]:
-                self._index_model_calls(attempt_id, chunk["payload"])
         return response
+
+    def _mark_stream_interrupted(
+        self,
+        *,
+        attempt_id: str,
+        chunks: list[dict[str, Any]],
+        tokens: dict[str, list[int]],
+        reason: str,
+    ) -> None:
+        entry = self._inflight.get(attempt_id)
+        if entry is None:
+            return
+        entry.update(
+            {
+                "interrupted_at_ns": monotonic_ns(),
+                "interruption": reason,
+                "partial_response": {"chunks": chunks},
+                "partial_prompt_token_ids": list(tokens["prompt_token_ids"]),
+                "partial_response_token_ids": list(tokens["response_token_ids"]),
+            }
+        )
 
     async def _capture_engine(self, attempt_id: str, committed: list[int]) -> dict[str, Any] | None:
         """Read back what the engine actually sampled for this call.
@@ -698,7 +764,17 @@ class LLMStore:
                 await response.write(encode_sse("[DONE]"))
                 continue
             await response.write(encode_sse(json.dumps(chunk["payload"], separators=(",", ":"))))
-        await response.write_eof()
+        try:
+            await response.write_eof()
+        except ConnectionResetError:
+            chunks = expected["response"]["chunks"]
+            stream_complete = any(chunk.get("done") for chunk in chunks) or any(
+                isinstance(chunk.get("payload"), dict)
+                and stream_payload_is_terminal(str(expected["api"]), chunk["payload"])
+                for chunk in chunks
+            )
+            if not stream_complete:
+                raise
         return response
 
     async def _run_upstream(
@@ -733,10 +809,20 @@ class LLMStore:
             "chat/completions" if api == "chat.completions" else "responses"
         )
         async with self.client.post(url, json=body) as upstream:
-            payload = await upstream.json()
-        if upstream.status != int(expected.get("status_code", 200)):
+            status = upstream.status
+            if expected["stream"]:
+                # Full replay needs the engine to execute every sampler step, but
+                # never hands its fresh chunking to the framework. Drain the SSE
+                # body so generation completes; the recorded bytes are emitted by
+                # ``_replay_stream`` after audit verification.
+                async for _data in upstream.content.iter_any():
+                    pass
+                payload = None
+            else:
+                payload = await upstream.json()
+        if status != int(expected.get("status_code", 200)):
             raise MismatchError(
-                f"forced replay of {attempt_id} returned HTTP {upstream.status}, "
+                f"forced replay of {attempt_id} returned HTTP {status}, "
                 f"the recording saw {expected.get('status_code')}"
             )
         committed = list(expected["response_token_ids"])
@@ -833,7 +919,11 @@ class LLMStore:
         tails: list[dict[str, Any]] = []
         for attempt_id, entry in list(self._inflight.items()):
             tail = dict(entry)
-            tail["elapsed_ns"] = max(0, cutoff_at_ns - int(entry["started_at_ns"]))
+            observed_end = min(
+                cutoff_at_ns,
+                int(entry.get("interrupted_at_ns", cutoff_at_ns)),
+            )
+            tail["elapsed_ns"] = max(0, observed_end - int(entry["started_at_ns"]))
             tails.append(tail)
             self._truncated.add(attempt_id)
             self._truncated_elapsed[attempt_id] = tail["elapsed_ns"]
@@ -892,9 +982,7 @@ class LLMStore:
 
     def outstanding(self) -> dict[str, Any]:
         missing = {
-            f"{key}": sum(
-                str(record["attempt_id"]) not in self._delivered for record in queue
-            )
+            f"{key}": sum(str(record["attempt_id"]) not in self._delivered for record in queue)
             for key, queue in self._expected.items()
             if any(str(record["attempt_id"]) not in self._delivered for record in queue)
         }
@@ -1009,9 +1097,7 @@ def _live_multimodal_request_shape(body: dict[str, Any]) -> dict[str, Any] | Non
         if isinstance(message, dict) and message.get("role") == "system"
     ]
     other_payload = {
-        key: _shape(value)
-        for key, value in body.items()
-        if key in {"input", "prompt"}
+        key: _shape(value) for key, value in body.items() if key in {"input", "prompt"}
     }
     return {
         "payload": {
@@ -1022,9 +1108,7 @@ def _live_multimodal_request_shape(body: dict[str, Any]) -> dict[str, Any] | Non
             },
         },
         "configuration": {
-            key: value
-            for key, value in body.items()
-            if key not in {"messages", "input", "prompt"}
+            key: value for key, value in body.items() if key not in {"messages", "input", "prompt"}
         },
     }
 
@@ -1070,11 +1154,7 @@ def _live_document_request_shape(body: dict[str, Any]) -> dict[str, Any] | None:
         if end < 0:
             return value
         found = True
-        return (
-            value[: start + len(opening)]
-            + "\n<live-document-chunk>\n"
-            + value[end:]
-        )
+        return value[: start + len(opening)] + "\n<live-document-chunk>\n" + value[end:]
 
     projected = redact(body)
     if not found:
@@ -1088,8 +1168,7 @@ def _first_shape_difference(expected: Any, observed: Any, path: str = "$") -> st
 
     if type(expected) is not type(observed):
         return (
-            f"{path}: expected type {type(expected).__name__}, "
-            f"observed {type(observed).__name__}"
+            f"{path}: expected type {type(expected).__name__}, observed {type(observed).__name__}"
         )
     if isinstance(expected, dict):
         expected_keys = set(expected)
@@ -1100,9 +1179,7 @@ def _first_shape_difference(expected: Any, observed: Any, path: str = "$") -> st
                 f"observed {sorted(observed_keys)!r}"
             )
         for key in sorted(expected):
-            difference = _first_shape_difference(
-                expected[key], observed[key], f"{path}.{key}"
-            )
+            difference = _first_shape_difference(expected[key], observed[key], f"{path}.{key}")
             if difference is not None:
                 return difference
         return None
@@ -1112,9 +1189,7 @@ def _first_shape_difference(expected: Any, observed: Any, path: str = "$") -> st
         for index, (expected_item, observed_item) in enumerate(
             zip(expected, observed, strict=True)
         ):
-            difference = _first_shape_difference(
-                expected_item, observed_item, f"{path}[{index}]"
-            )
+            difference = _first_shape_difference(expected_item, observed_item, f"{path}[{index}]")
             if difference is not None:
                 return difference
         return None
