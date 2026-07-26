@@ -83,6 +83,33 @@ def _operation_spreads(runs: list[dict[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _internal_gap_seconds(timeline: dict[str, Any]) -> float:
+    """Count only blanks bounded by instrumented work on both sides.
+
+    Startup and tail gaps remain visible in the report, but they describe the
+    framework outside its recorded causal work. Treating either as missing
+    instrumentation makes short runs fail based on process startup or idle
+    teardown time rather than on replay completeness.
+    """
+
+    window = timeline.get("window_s", 0.0)
+    if not isinstance(window, (int, float)) or isinstance(window, bool):
+        return 0.0
+    total = 0.0
+    for gap in timeline.get("gaps", []):
+        start = gap.get("start_s")
+        end = gap.get("end_s")
+        duration = gap.get("duration_s")
+        if not all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in (start, end, duration)
+        ):
+            continue
+        if start > 0.001 and end < window - 0.001:
+            total += duration
+    return total
+
+
 def build_report(
     *,
     bundle_dir: Path,
@@ -105,12 +132,12 @@ def build_report(
                     f"{run['run_id']}: replayed {observed} {kind} records, "
                     f"the bundle holds {expected}"
                 )
-        unattributed = run["timeline"].get("unattributed_gap_seconds", 0.0)
         window = run["timeline"].get("window_s", 0.0)
-        if window > 0 and unattributed / window > 0.5:
+        internal_gap = _internal_gap_seconds(run["timeline"])
+        if window > 0 and internal_gap / window > 0.5:
             reasons.append(
-                f"{run['run_id']}: {unattributed:.1f}s of a {window:.1f}s window has no "
-                "instrumented activity"
+                f"{run['run_id']}: {internal_gap:.1f}s of a {window:.1f}s window has "
+                "uninstrumented gaps between recorded operations"
             )
 
     spreads = {
@@ -160,6 +187,9 @@ def build_report(
                     "coverage_fraction": run["timeline"].get("coverage_fraction"),
                     "unattributed_gap_seconds": run["timeline"].get(
                         "unattributed_gap_seconds"
+                    ),
+                    "internal_gap_seconds": round(
+                        _internal_gap_seconds(run["timeline"]), 3
                     ),
                     "largest_gaps": sorted(
                         run["timeline"].get("gaps", []),
