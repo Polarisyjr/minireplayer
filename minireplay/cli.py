@@ -10,7 +10,13 @@ from .config import load_config
 from .errors import ReplayError
 from .llm_store import REPLAY_MODES
 from .report import build_report
-from .serving import assert_forced_capable, running_vllm_containers, start, stop
+from .serving import (
+    assert_forced_capable,
+    running_vllm_containers,
+    start,
+    stop,
+    wait_serving_ready,
+)
 from .supervisor import record_bundle, replay_bundle
 from .util import atomic_write_json
 
@@ -171,6 +177,7 @@ def _run(arguments: argparse.Namespace) -> int:
         containers = running_vllm_containers()
         for container in containers:
             assert_forced_capable(container)
+        wait_serving_ready(list(config.targets.values()))
         print(
             json.dumps(
                 {

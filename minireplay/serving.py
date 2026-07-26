@@ -19,6 +19,9 @@ from __future__ import annotations
 import os
 import secrets as secrets_module
 import subprocess
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -159,3 +162,38 @@ def running_vllm_containers() -> list[str]:
     if result.returncode != 0:
         return []
     return [name for name in result.stdout.split() if name]
+
+
+def wait_serving_ready(
+    targets: list[str],
+    *,
+    timeout_s: float = 600.0,
+    poll_s: float = 2.0,
+) -> None:
+    """Wait for every configured model API, not merely its listening socket."""
+
+    pending = {target.rstrip("/") for target in targets}
+    deadline = time.monotonic() + timeout_s
+    last_errors: dict[str, str] = {}
+    while pending:
+        for target in tuple(pending):
+            try:
+                with urllib.request.urlopen(f"{target}/v1/models", timeout=3) as response:
+                    if response.status == 200:
+                        pending.remove(target)
+                        last_errors.pop(target, None)
+                    else:
+                        last_errors[target] = f"HTTP {response.status}"
+            except (OSError, urllib.error.URLError) as exc:
+                last_errors[target] = str(exc)
+        if not pending:
+            return
+        if time.monotonic() >= deadline:
+            details = ", ".join(
+                f"{target}: {last_errors.get(target, 'not ready')}"
+                for target in sorted(pending)
+            )
+            raise InfrastructureError(
+                f"vLLM fleet did not become API-ready within {timeout_s:g}s ({details})"
+            )
+        time.sleep(poll_s)
