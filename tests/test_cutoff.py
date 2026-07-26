@@ -12,8 +12,14 @@ from tests.support import dispatch, llm, span, tool
 def stage(tmp_path: Path, **records) -> Path:
     root = tmp_path / "stage"
     root.mkdir()
-    for relative in ("llm.jsonl", "spans.jsonl", "dispatches.jsonl", "tools.jsonl",
-                     "graders.jsonl", "artifacts.jsonl"):
+    for relative in (
+        "llm.jsonl",
+        "spans.jsonl",
+        "dispatches.jsonl",
+        "tools.jsonl",
+        "graders.jsonl",
+        "artifacts.jsonl",
+    ):
         (root / relative).touch()
     for relative, entries in records.items():
         for entry in entries:
@@ -91,7 +97,7 @@ def test_missing_parent_drops_the_whole_descendant_branch(tmp_path: Path) -> Non
     assert list(iter_jsonl(root / "spans.jsonl")) == []
 
 
-def test_llm_below_a_cutoff_tool_is_not_fixed_work(tmp_path: Path) -> None:
+def test_llm_below_an_ordinary_cutoff_tool_is_not_fixed_work(tmp_path: Path) -> None:
     child = llm(attempt_id="llm-child")
     root = stage(
         tmp_path,
@@ -109,6 +115,37 @@ def test_llm_below_a_cutoff_tool_is_not_fixed_work(tmp_path: Path) -> None:
     close_stage_at_cutoff(root)
     assert ids(root, "llm.jsonl", "attempt_id") == set()
     assert list(iter_jsonl(root / "spans.jsonl")) == []
+
+
+def test_closed_llm_below_a_composite_task_cutoff_is_preserved(tmp_path: Path) -> None:
+    child = llm(attempt_id="llm-child")
+    root = stage(
+        tmp_path,
+        **{
+            "llm.jsonl": [child],
+            "spans.jsonl": [
+                {
+                    **span(child["span_id"], parent="span-task-cutoff"),
+                    "kind": "llm",
+                    "name": "llm:coral-subagent",
+                }
+            ],
+        },
+    )
+    close_stage_at_cutoff(
+        root,
+        cutoff_tails={
+            "operations": [
+                {
+                    "span_id": "span-task-cutoff",
+                    "replay_entry": "enter-and-preserve-descendants",
+                }
+            ]
+        },
+    )
+
+    assert ids(root, "llm.jsonl", "attempt_id") == {"llm-child"}
+    assert ids(root, "spans.jsonl", "span_id") == {child["span_id"]}
 
 
 def test_report_counts_what_was_discarded(tmp_path: Path) -> None:

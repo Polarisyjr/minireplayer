@@ -27,10 +27,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .bundle import Bundle, build_bundle, bundle_id_for, load_bundle
+from .bundle import (
+    Bundle,
+    build_bundle,
+    bundle_id_for,
+    load_bundle,
+    materialize_pre_dispatch_tails,
+)
 from .cgroup import RoleCgroup
 from .config import RunConfig
 from .constants import LEDGER_FILES, TERMINAL_SCHEMA
+from .coral_control import fixed_invocation_limits, recorded_restart_controls
 from .cutoff import close_stage_at_cutoff
 from .errors import InfrastructureError, MismatchError
 from .lane_record import materialize_lane_recording
@@ -229,6 +236,7 @@ class Supervisor:
                 "NATIVE_REPLAY_INSTRUMENTATION_STATUS_DIR": str(self.status_dir),
                 "NATIVE_REPLAY_LANE_EVENT_DIR": str(self.lane_event_dir),
                 "NATIVE_REPLAY_RUNTIME_IDENTITY_DIR": str(self.output / "runtime-identities"),
+                "NATIVE_REPLAY_OPENCODE_IDENTITY": "opencode-native-replay-plugin",
                 "NATIVE_REPLAY_CONCURRENCY": str(self.config.concurrency),
                 "NATIVE_REPLAY_SCOPE": f"C{self.config.concurrency}",
                 "NATIVE_REPLAY_GATE_TIMEOUT_S": str(max(600, self.config.duration_s * 2)),
@@ -254,6 +262,35 @@ class Supervisor:
             if bindings:
                 environment["NATIVE_REPLAY_SOURCE_IDENTITY_BINDINGS"] = json.dumps(
                     bindings, sort_keys=True
+                )
+            if self.config.adapter == "coral":
+                limits = fixed_invocation_limits(
+                    self.bundle.llm,
+                    self.bundle.cutoff_tails,
+                )
+                controls = list(self.bundle.manifest.get("coral_controls", []))
+                expected_controls = {
+                    (actor_id, invocation_index)
+                    for actor_id, limit in limits.items()
+                    for invocation_index in range(1, limit)
+                }
+                observed_controls = {
+                    (str(control.get("actor_id")), int(control.get("invocation_index", -1)))
+                    for control in controls
+                }
+                if expected_controls != observed_controls:
+                    raise InfrastructureError(
+                        "CORAL replay bundle has incomplete recorded restart controls: "
+                        f"expected={sorted(expected_controls)!r} "
+                        f"observed={sorted(observed_controls)!r}; re-record the source"
+                    )
+                environment["NATIVE_REPLAY_CORAL_INVOCATION_LIMITS"] = json.dumps(
+                    limits,
+                    sort_keys=True,
+                )
+                environment["NATIVE_REPLAY_CORAL_CONTROLS"] = json.dumps(
+                    controls,
+                    sort_keys=True,
                 )
         # The config may legitimately need to extend PYTHONPATH (a framework
         # installed outside site-packages, say). It must never replace it: the
@@ -558,6 +595,7 @@ class Supervisor:
             services.stop()
             self._remove_external_tmux_dir()
 
+        terminals = self._collect_terminals()
         observed_records: dict[str, list[dict[str, Any]]] | None = None
         if self.mode == "record" and failure is None:
             try:
@@ -570,6 +608,26 @@ class Supervisor:
                     run_root=self.output,
                     repo=self.config.repo,
                 )
+                cutoff_tails = materialize_pre_dispatch_tails(
+                    adapter=self.config.adapter,
+                    llm=list(iter_jsonl(self.stage / "llm.jsonl")),
+                    dispatches=list(iter_jsonl(self.stage / LEDGER_FILES["dispatch"])),
+                    cutoff_tails=cutoff_tails,
+                )
+                gate = read_json(self.gate_path)
+                cutoff_tails = _apply_coral_task_cutoffs(
+                    adapter=self.config.adapter,
+                    cutoff_tails=cutoff_tails,
+                    task_terminals=terminals,
+                    actors=_actors_from_stage(
+                        self.stage,
+                        self.ready_dir,
+                        cutoff_tails,
+                        self.lane_binding_dir,
+                    ),
+                    gate_at_ns=metrics.gate_at_ns,
+                    gate_at_epoch_ns=int(gate["opened_at_epoch_ns"]),
+                )
                 # Step3 describes what was observed inside the source window.
                 # Preserve that view before causal closure removes completed
                 # descendants of an operation that remained open at cutoff.
@@ -581,10 +639,20 @@ class Supervisor:
         atomic_write_json(self.output / "llm-models.json", services.llm.model_catalogue)
 
         if self.mode == "record" and failure is None:
-            close_stage_at_cutoff(self.stage)
+            close_stage_at_cutoff(self.stage, cutoff_tails=cutoff_tails)
 
         records = self._stage_records()
-        terminals = self._collect_terminals()
+        if failure is None:
+            failed_tasks = _unexpected_failed_tasks(
+                mode=self.mode,
+                reason=reason,
+                bundle=self.bundle,
+                task_terminals=terminals,
+            )
+            if failed_tasks:
+                failure = InfrastructureError(
+                    "native task terminal reported failure for " + ", ".join(sorted(failed_tasks))
+                )
         terminal = {
             "schema_version": TERMINAL_SCHEMA,
             "status": "failure" if failure is not None else "success",
@@ -603,6 +671,12 @@ class Supervisor:
 
         if self.mode == "record" and failure is None:
             gate = read_json(self.gate_path)
+            step3_actors = _actors_from_stage(
+                self.stage,
+                self.ready_dir,
+                cutoff_tails,
+                self.lane_binding_dir,
+            )
             export_step3(
                 output=self.output,
                 run_id=self.run_id,
@@ -613,6 +687,12 @@ class Supervisor:
                 gate_at_ns=metrics.gate_at_ns,
                 gate_at_epoch_ns=int(gate["opened_at_epoch_ns"]),
                 terminal_at_ns=metrics.terminal_at_ns,
+                actor_lanes={
+                    str(actor["actor_id"]): actor["lane"]
+                    for actor in step3_actors
+                    if isinstance(actor.get("lane"), dict)
+                },
+                task_terminals=terminals,
             )
 
         summary = metrics.summary(
@@ -651,6 +731,41 @@ class Supervisor:
         )
 
 
+def _unexpected_failed_tasks(
+    *,
+    mode: str,
+    reason: str,
+    bundle: Bundle | None,
+    task_terminals: list[dict[str, Any]],
+) -> list[str]:
+    """Reject native failures except an expected cutoff-open task timeout."""
+
+    cutoff_sources = (
+        bundle.cutoff_source_actor_ids()
+        if mode == "replay" and reason == "fixed-work-complete" and bundle is not None
+        else set()
+    )
+    actor_map = bundle.actor_map() if bundle is not None else {}
+    failed: list[str] = []
+    for terminal in task_terminals:
+        if terminal.get("status") != "failure":
+            continue
+        actor_id = str(terminal.get("actor_id", "unknown"))
+        task = terminal.get("task")
+        source = task.get("source_actor_id") if isinstance(task, dict) else None
+        result = terminal.get("result")
+        error_type = result.get("error_type") if isinstance(result, dict) else None
+        expected_cutoff = (
+            isinstance(source, str)
+            and source in cutoff_sources
+            and actor_map.get(source) == actor_id
+            and error_type == "TimeoutError"
+        )
+        if not expected_cutoff:
+            failed.append(actor_id)
+    return failed
+
+
 def _actors_from_stage(
     stage: Path,
     ready_dir: Path,
@@ -660,41 +775,71 @@ def _actors_from_stage(
     """Inventory the actors a recording actually saw."""
 
     by_actor: dict[str, dict[str, Any]] = {}
+
+    def declare(
+        actor: str,
+        *,
+        source: Any = None,
+        process_role: Any = None,
+        metadata: Any = None,
+    ) -> dict[str, Any]:
+        entry = by_actor.setdefault(
+            actor,
+            {
+                "actor_id": actor,
+                "source_actor_id": None,
+                "source_actor_ids": [],
+                "process_role": process_role,
+                "task": {"dynamic_actor": actor},
+            },
+        )
+        if isinstance(source, str) and source:
+            aliases = entry["source_actor_ids"]
+            if source not in aliases:
+                aliases.append(source)
+            if entry.get("source_actor_id") is None:
+                entry["source_actor_id"] = source
+                entry["task"] = {"source_actor_id": source}
+        if entry.get("process_role") is None and isinstance(process_role, str):
+            entry["process_role"] = process_role
+        if metadata is not None:
+            require(isinstance(metadata, dict), f"actor {actor!r} metadata is not an object")
+            previous = entry.get("lane")
+            require(
+                previous is None or previous == metadata,
+                f"actor {actor!r} declared conflicting lane metadata",
+            )
+            entry["lane"] = metadata
+        return entry
+
     for path in sorted(ready_dir.glob("*.json")):
-        entry = read_json(path)
-        actor = str(entry["actor_id"])
-        by_actor[actor] = {
-            "actor_id": actor,
-            "source_actor_id": entry.get("source_actor_id"),
-            "process_role": entry.get("process_role"),
-            "task": {"source_actor_id": entry.get("source_actor_id")},
-        }
-        by_actor[actor]["source_actor_ids"] = [entry.get("source_actor_id")]
+        ready = read_json(path)
+        actor = str(ready["actor_id"])
+        declare(
+            actor,
+            source=ready.get("source_actor_id"),
+            process_role=ready.get("process_role"),
+            metadata=ready.get("actor_metadata"),
+        )
 
     if lane_binding_dir is not None and lane_binding_dir.is_dir():
         for path in sorted(lane_binding_dir.glob("*.json")):
             binding = read_json(path)
             actor = str(binding.get("actor_id", ""))
-            require(
-                actor in by_actor,
-                f"native lane {actor!r} first appeared after the start gate",
+            require(bool(actor), f"native lane binding has no actor: {path}")
+            declare(
+                actor,
+                source=binding.get("source_actor_id"),
+                process_role=binding.get("process_role"),
+                metadata=binding.get("actor_metadata"),
             )
-            source = binding.get("source_actor_id")
-            aliases = by_actor[actor]["source_actor_ids"]
-            if isinstance(source, str) and source and source not in aliases:
-                aliases.append(source)
 
     def observe(record: dict[str, Any]) -> None:
         actor = str(record.get("actor_id", ""))
-        if actor and actor not in by_actor:
+        if actor:
             # Sweeps refill work into actors that never sat at the gate. An actor
             # first seen immediately before cutoff may exist only in a tail.
-            by_actor[actor] = {
-                "actor_id": actor,
-                "source_actor_id": None,
-                "process_role": record.get("process_role"),
-                "task": {"dynamic_actor": actor},
-            }
+            declare(actor, process_role=record.get("process_role"))
 
     for relative in ("llm.jsonl", *LEDGER_FILES.values()):
         path = stage / relative
@@ -706,6 +851,90 @@ def _actors_from_stage(
         for record in (cutoff_tails or {}).get(key, []):
             observe(record)
     return [by_actor[key] for key in sorted(by_actor)]
+
+
+def _apply_coral_task_cutoffs(
+    *,
+    adapter: str,
+    cutoff_tails: dict[str, Any],
+    task_terminals: list[dict[str, Any]],
+    actors: list[dict[str, Any]],
+    gate_at_ns: int,
+    gate_at_epoch_ns: int,
+) -> dict[str, Any]:
+    """Clamp killed CORAL agent work to the manager's real team cutoff.
+
+    The sweep source window may continue after ``max_total_turns`` kills a team.
+    That later sample boundary must not make an interrupted LLM or OpenCode tool
+    look active through the idle remainder of the 180-second window.
+    """
+
+    rendered = {
+        "operations": [dict(record) for record in cutoff_tails.get("operations", [])],
+        "llm_requests": [dict(record) for record in cutoff_tails.get("llm_requests", [])],
+    }
+    if adapter != "coral":
+        return rendered
+
+    children: dict[str, set[str]] = {}
+    for actor in actors:
+        actor_id = actor.get("actor_id")
+        lane = actor.get("lane")
+        if not isinstance(actor_id, str) or not isinstance(lane, dict):
+            continue
+        parent = lane.get("parent_actor_id")
+        if lane.get("lane_kind") == "agent" and isinstance(parent, str):
+            children.setdefault(parent, set()).add(actor_id)
+
+    actor_cutoffs: dict[str, tuple[int, int, str]] = {}
+    for terminal in task_terminals:
+        if not isinstance(terminal, dict):
+            continue
+        team_actor = terminal.get("actor_id")
+        result = terminal.get("result")
+        if not isinstance(team_actor, str) or not isinstance(result, dict):
+            continue
+        cutoff_epoch = result.get("replay_cutoff_at_epoch_ns")
+        reason = result.get("termination_reason")
+        if not isinstance(cutoff_epoch, int) or not isinstance(reason, str):
+            continue
+        cutoff_monotonic = gate_at_ns + (cutoff_epoch - gate_at_epoch_ns)
+        for actor_id in children.get(team_actor, set()):
+            actor_cutoffs[actor_id] = (cutoff_monotonic, cutoff_epoch, reason)
+
+    def clamp(record: dict[str, Any]) -> None:
+        cutoff = actor_cutoffs.get(str(record.get("actor_id")))
+        if cutoff is None:
+            return
+        cutoff_monotonic, cutoff_epoch, reason = cutoff
+        started = record.get("started_at_ns", record.get("source_started_at_ns"))
+        if not isinstance(started, int):
+            return
+        current_end = started + int(record.get("elapsed_ns", 0))
+        if (
+            record.get("replay_entry") == "enter-and-preserve-descendants"
+            and record.get("name") == "task"
+        ):
+            # A synthesized CORAL task boundary is proven active by its child
+            # sessions even when OpenCode omitted tool.execute.before. Its real
+            # end is the manager's team cutoff, not the zero-duration point at
+            # which the parent LLM emitted the task call.
+            current_end = cutoff_monotonic
+        observed_end = record.get("interrupted_at_ns")
+        if isinstance(observed_end, int):
+            current_end = min(current_end, observed_end)
+        ended = max(started, min(current_end, cutoff_monotonic))
+        record["elapsed_ns"] = ended - started
+        record["lane_terminated_at_ns"] = cutoff_monotonic
+        record["lane_terminated_at_epoch_ns"] = cutoff_epoch
+        record["lane_termination_reason"] = reason
+
+    for record in rendered["llm_requests"]:
+        clamp(record)
+    for record in rendered["operations"]:
+        if record.get("process_role") == "coral-opencode":
+            clamp(record)
+    return rendered
 
 
 def _identity_bindings(directory: Path) -> dict[str, Any]:
@@ -736,11 +965,15 @@ def record_bundle(
     run_id: str | None = None,
 ) -> Bundle:
     identity = config.workload_identity()
+    bundle_id = bundle_id_for(identity)
     run = Supervisor(
         mode="record",
         config=config,
         output=output,
-        run_id=run_id or f"record-{bundle_id_for(identity)}",
+        # Bundle identity is intentionally stable; native sweep output ownership
+        # is not. A unique suffix prevents a retry of the same workload from
+        # reopening the previous framework results directory.
+        run_id=run_id or f"record-{bundle_id}-{secrets.token_hex(4)}",
     ).run()
 
     cutoff_tails = read_json(run.root / "cutoff-tails.json")
@@ -751,10 +984,23 @@ def record_bundle(
         run.root / "lane-bindings",
     )
     require(bool(actors), "the recording observed no actors")
+    llm = list(iter_jsonl(run.root / "stage" / "llm.jsonl"))
+    graders = list(iter_jsonl(run.root / "stage" / "graders.jsonl"))
+    invocation_limits = fixed_invocation_limits(llm, cutoff_tails)
+    coral_controls = (
+        recorded_restart_controls(
+            actors=actors,
+            task_terminals=list(run.terminal.get("task_terminals", [])),
+            graders=graders,
+            invocation_limits=invocation_limits,
+        )
+        if config.adapter == "coral"
+        else []
+    )
     return build_bundle(
         stage_dir=run.root / "stage",
         output=bundle_output,
-        bundle_id=bundle_id_for(identity),
+        bundle_id=bundle_id,
         adapter=config.adapter,
         workload=identity,
         actors=actors,
@@ -766,6 +1012,7 @@ def record_bundle(
         cutoff_tails=cutoff_tails,
         llm_models=read_json(run.root / "llm-models.json"),
         identity_bindings=_identity_bindings(run.root / "runtime-identities"),
+        coral_controls=coral_controls,
     )
 
 

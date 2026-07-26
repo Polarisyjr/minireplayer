@@ -197,6 +197,32 @@ def test_replay_rejects_a_workload_change(tmp_path: Path, vllm) -> None:
 
 
 @pytest.mark.timeout(300)
+def test_record_rejects_a_failed_native_task(
+    tmp_path: Path,
+    vllm,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_config(write_config(tmp_path, vllm.url, duration=1))
+    monkeypatch.setenv("FAKE_AGENT_TERMINAL_STATUS", "failure")
+
+    with pytest.raises(
+        InfrastructureError,
+        match="native task terminal reported failure",
+    ):
+        record_bundle(
+            config=config,
+            output=tmp_path / "source-failed",
+            bundle_output=tmp_path / "bundle-failed",
+            run_id="record-failed",
+        )
+
+    terminal = read_json(tmp_path / "source-failed" / "terminal.json")
+    assert terminal["status"] == "failure"
+    assert terminal["task_terminals"][0]["status"] == "failure"
+    assert not (tmp_path / "bundle-failed").exists()
+
+
+@pytest.mark.timeout(300)
 def test_replay_stops_at_the_recorded_amount_of_work(tmp_path: Path, vllm, monkeypatch) -> None:
     """A replay does the recorded work and no more, even if the framework wants to.
 

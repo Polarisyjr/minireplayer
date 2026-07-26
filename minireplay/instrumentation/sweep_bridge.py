@@ -34,6 +34,16 @@ def _run_index(command: list[str]) -> int:
     raise RuntimeError("CORAL sweep launch has no run index")
 
 
+def _required_queue_integer(environment: dict[str, str], name: str) -> int:
+    try:
+        value = int(environment[name])
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError(f"CORAL queue launch has no valid {name}") from exc
+    if value < 0:
+        raise RuntimeError(f"CORAL queue launch has negative {name}")
+    return value
+
+
 def _queue_popen_factory(original):
     def wrapped(self, *args: Any, **kwargs: Any) -> None:
         command = args[0] if args else kwargs.get("args")
@@ -48,9 +58,34 @@ def _queue_popen_factory(original):
             source = _coral_source_id(values[2])
             actor_source = source if run_index < concurrency else f"refill-{run_index:06d}"
             environment = dict(kwargs.get("env") or os.environ)
+            queue_run_index = _required_queue_integer(
+                environment, "MULTIAGENT_CORAL_RUN_INDEX"
+            )
+            team_slot = _required_queue_integer(
+                environment, "MULTIAGENT_CORAL_TEAM_SLOT"
+            )
+            slot_generation = _required_queue_integer(
+                environment, "MULTIAGENT_CORAL_SLOT_GENERATION"
+            )
+            team_size = _required_queue_integer(
+                environment, "MULTIAGENT_CORAL_TEAM_SIZE"
+            )
+            if queue_run_index != run_index:
+                raise RuntimeError(
+                    "CORAL queue run index disagrees with workspace.run_dir"
+                )
+            if team_slot >= concurrency:
+                raise RuntimeError("CORAL queue team slot is outside the concurrency window")
+            if team_size != 4:
+                raise RuntimeError("CORAL replay requires exactly four agents per team")
             environment.update(
                 {
                     "NATIVE_REPLAY_CORAL_TASK_ID": actor_source,
+                    "NATIVE_REPLAY_CORAL_SOURCE_TASK_ID": source,
+                    "NATIVE_REPLAY_CORAL_RUN_INDEX": str(run_index),
+                    "NATIVE_REPLAY_CORAL_TEAM_SLOT": str(team_slot),
+                    "NATIVE_REPLAY_CORAL_SLOT_GENERATION": str(slot_generation),
+                    "NATIVE_REPLAY_CORAL_TEAM_SIZE": str(team_size),
                     "NATIVE_REPLAY_PROCESS_ROLE": "framework",
                 }
             )

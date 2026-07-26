@@ -131,6 +131,31 @@ def test_terminal_actor_does_not_hide_an_extra_operation(tmp_path: Path) -> None
         service.boundary.start(start_tool("done", "extra"))
 
 
+def test_refill_lane_remains_a_cutoff_actor_after_initial_task_terminal(
+    tmp_path: Path,
+) -> None:
+    bundle = make_bundle(actors=["lane-0"])
+    bundle.manifest["actors"] = [
+        {
+            "actor_id": "lane-0",
+            "source_actor_id": "initial",
+            "source_actor_ids": ["initial", "refill"],
+        }
+    ]
+    bundle.terminal["task_terminals"] = [
+        {
+            "actor_id": "lane-0",
+            "status": "success",
+            "task": {"source_actor_id": "initial"},
+        }
+    ]
+    service = services(tmp_path, bundle)
+
+    assert service.cutoff_actor_prefix_consumed("lane-0") is True
+    with pytest.raises(WorkloadComplete):
+        service.boundary.start(start_tool("lane-0", "extra"))
+
+
 def test_cutoff_dispatch_is_stopped_before_native_entry(tmp_path: Path) -> None:
 
     tail = dispatch(

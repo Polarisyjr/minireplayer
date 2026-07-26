@@ -5,9 +5,11 @@ import path from "node:path"
 const endpoint = process.env.NATIVE_REPLAY_BOUNDARY_URL
 const token = process.env.NATIVE_REPLAY_BOUNDARY_TOKEN
 const actor = process.env.NATIVE_REPLAY_ACTOR_ID
+const invocation = process.env.NATIVE_REPLAY_INVOCATION_ID || actor
 const role = "coral-opencode"
 const reservations = new Map()
 const dispatchReservations = new Map()
+const startPromises = new Map()
 const completed = new Set()
 const completionPromises = new Map()
 const sessionNames = new Map()
@@ -17,6 +19,7 @@ const activeTasks = new Map()
 const toolArguments = new Map()
 const toolNames = new Map()
 const subprocessTools = new Set(["bash", "shell", "glob", "grep", "skill"])
+let nativeWorkspace
 let gatePromise
 const observationMetadata = {
   bash: ["output"],
@@ -25,7 +28,6 @@ const observationMetadata = {
   read: ["preview", "display"],
   task: ["parentSessionId", "sessionId"],
 }
-
 function recordedResultContract(tool) {
   const pointers = ["/output", "/error"]
   for (const field of observationMetadata[tool] || []) pointers.push(`/metadata/${field}`)
@@ -85,7 +87,7 @@ async function post(route, payload) {
 
 function stableSession(sessionID) {
   if (sessionNames.has(sessionID)) return sessionNames.get(sessionID)
-  const value = `${required("actor", actor)}/root-${sessionNames.size}`
+  const value = `${required("invocation", invocation)}/root-${sessionNames.size}`
   sessionNames.set(sessionID, value)
   return value
 }
@@ -158,6 +160,123 @@ function ensureGate() {
   return gatePromise
 }
 
+function eventStartArguments(part) {
+  if (part.state?.status === "running") return part.state.input || {}
+  if (part.tool !== "task" || part.state?.status !== "pending") return null
+  if (
+    part.state.input
+    && typeof part.state.input === "object"
+    && Object.keys(part.state.input).length
+  ) {
+    return part.state.input
+  }
+  // The built-in task tool can bypass tool.execute.before. Its pending part is
+  // streamed repeatedly, so wait until the raw argument object is complete
+  // before reserving the native operation.
+  try {
+    const parsed = JSON.parse(part.state.raw)
+    return parsed && typeof parsed === "object" ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+async function runningTaskForChild(
+  client,
+  directory,
+  parentSessionID,
+  childSessionID,
+) {
+  // Some OpenCode versions persist the task's running state and create the
+  // child session without publishing tool.execute.before (or even a usable
+  // pending-part event). Backfill from the framework's own message store before
+  // the child can issue its first LLM request.
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const response = await client.session.messages({
+      path: { id: parentSessionID },
+      query: { directory },
+    })
+    const messages = Array.isArray(response.data) ? response.data : []
+    const candidates = messages
+      .flatMap((message) => Array.isArray(message.parts) ? message.parts : [])
+      .filter((part) => (
+        part?.type === "tool"
+        && part.tool === "task"
+        && ["pending", "running"].includes(part.state?.status)
+      ))
+    const exact = candidates.find((part) => {
+      const metadata = part.state?.metadata
+      return metadata?.sessionId === childSessionID || metadata?.sessionID === childSessionID
+    })
+    if (exact) return exact
+    if (candidates.length === 1) return candidates[0]
+    await Bun.sleep(20)
+  }
+  return null
+}
+
+async function startTool(callID, tool, sessionID, args) {
+  if (reservations.has(callID)) return null
+  const existing = startPromises.get(callID)
+  if (existing) return await existing
+
+  const pending = (async () => {
+    await ensureGate()
+    toolNames.set(callID, tool)
+    const dispatch = await post("/v1/boundary/start", {
+      kind: "dispatch",
+      actor_id: actor,
+      session_id: stableSession(sessionID),
+      process_role: role,
+      parent_span_id: sessionParents.get(sessionID) || null,
+      started_at_ns: monotonicNs(),
+      origin: {
+        kind: "llm_structured",
+        trigger_id: "auto",
+        model_call_id: callID,
+      },
+      parser_identity: "opencode.message.part.tool",
+      dispatcher_identity: "opencode.tool.execute.before",
+      native_call_id: callID,
+      name: tool,
+      arguments: args,
+      workspace_path: required("native workspace", nativeWorkspace),
+    })
+    if (dispatch.execution_arguments) {
+      for (const key of Object.keys(args)) delete args[key]
+      Object.assign(args, dispatch.execution_arguments)
+    }
+    toolArguments.set(callID, args)
+    dispatchReservations.set(callID, dispatch)
+    const reservation = await post("/v1/boundary/start", {
+      kind: "tool",
+      actor_id: actor,
+      process_role: role,
+      parent_span_id: dispatch.span_id,
+      started_at_ns: monotonicNs(),
+      dispatch_id: dispatch.record_id,
+      name: tool,
+      implementation: process.env.NATIVE_REPLAY_OPENCODE_IDENTITY || "opencode:unknown",
+      arguments: args,
+      workspace_path: required("native workspace", nativeWorkspace),
+      result_contract: recordedResultContract(tool),
+    })
+    reservations.set(callID, reservation)
+    if (tool === "task") {
+      const values = activeTasks.get(sessionID) || []
+      values.push(reservation)
+      activeTasks.set(sessionID, values)
+    }
+    return reservation
+  })()
+  startPromises.set(callID, pending)
+  try {
+    return await pending
+  } finally {
+    startPromises.delete(callID)
+  }
+}
+
 async function finish(callID, status, result) {
   if (completed.has(callID)) return null
   const existing = completionPromises.get(callID)
@@ -209,12 +328,13 @@ async function finish(callID, status, result) {
   }
 }
 
-export const NativeReplayPlugin = async () => {
+const NativeReplayPlugin = async ({ client, directory }) => {
+  nativeWorkspace = directory
   delete process.env.BUN_CONFIG_REGISTRY
   delete process.env.npm_config_registry
   return {
     event: async ({ event }) => {
-      if (event.type === "session.created") {
+      if (event.type === "session.created" || event.type === "session.created.1") {
         const info = event.properties.info
         if (info.parentID) {
           const parent = stableSession(info.parentID)
@@ -222,14 +342,62 @@ export const NativeReplayPlugin = async () => {
           childCounters.set(parent, index + 1)
           sessionNames.set(info.id, `${parent}/child-${index}`)
           const candidates = activeTasks.get(info.parentID) || []
-          if (candidates.length) sessionParents.set(info.id, candidates.shift().span_id)
+          let reservation = candidates.shift()
+          if (!reservation) {
+            const taskPart = await runningTaskForChild(
+              client,
+              directory,
+              info.parentID,
+              info.id,
+            )
+            if (!taskPart) {
+              throw new Error(
+                `native replay could not bind child session ${info.id} to its parent task`,
+              )
+            }
+            reservation = await startTool(
+              taskPart.callID,
+              taskPart.tool,
+              taskPart.sessionID,
+              eventStartArguments(taskPart) || {},
+            )
+            const queued = activeTasks.get(info.parentID) || []
+            const queuedIndex = queued.indexOf(reservation)
+            if (queuedIndex >= 0) queued.splice(queuedIndex, 1)
+          }
+          if (reservation) sessionParents.set(info.id, reservation.span_id)
         } else {
           stableSession(info.id)
         }
       }
-      if (event.type === "message.part.updated") {
+      if (
+        event.type === "message.part.updated"
+        || event.type === "message.part.updated.1"
+      ) {
         const part = event.properties.part
-        if (part.type === "tool" && part.state.status === "error") {
+        // OpenCode's built-in task/subagent tool can publish its running state
+        // without invoking tool.execute.before. Capture that state transition so
+        // the parent operation exists before the child session begins. The
+        // shared start promise also makes this safe for ordinary tools whose hook
+        // and event arrive concurrently.
+        const startArguments = part.type === "tool" ? eventStartArguments(part) : null
+        if (startArguments && !reservations.has(part.callID)) {
+          await startTool(
+            part.callID,
+            part.tool,
+            part.sessionID,
+            startArguments,
+          )
+        }
+        if (part.type === "tool" && part.state?.status === "error") {
+          if (!reservations.has(part.callID)) {
+            await startTool(
+              part.callID,
+              part.tool,
+              part.sessionID,
+              part.state.input || {},
+            )
+          }
           const tool = toolNames.get(part.callID)
           const completion = await finish(part.callID, "error", {
             error: part.state.error,
@@ -257,50 +425,7 @@ export const NativeReplayPlugin = async () => {
       if (parentSpan) output.headers["X-Native-Replay-Parent-Span"] = parentSpan
     },
     "tool.execute.before": async (input, output) => {
-      await ensureGate()
-      toolNames.set(input.callID, input.tool)
-      const dispatch = await post("/v1/boundary/start", {
-        kind: "dispatch",
-        actor_id: actor,
-        session_id: stableSession(input.sessionID),
-        process_role: role,
-        parent_span_id: sessionParents.get(input.sessionID) || null,
-        started_at_ns: monotonicNs(),
-        origin: {
-          kind: "llm_structured",
-          trigger_id: "auto",
-          model_call_id: input.callID,
-        },
-        parser_identity: "opencode.message.part.tool",
-        dispatcher_identity: "opencode.tool.execute.before",
-        native_call_id: input.callID,
-        name: input.tool,
-        arguments: output.args,
-      })
-      if (dispatch.execution_arguments) {
-        for (const key of Object.keys(output.args)) delete output.args[key]
-        Object.assign(output.args, dispatch.execution_arguments)
-      }
-      toolArguments.set(input.callID, output.args)
-      dispatchReservations.set(input.callID, dispatch)
-      const reservation = await post("/v1/boundary/start", {
-        kind: "tool",
-        actor_id: actor,
-        process_role: role,
-        parent_span_id: dispatch.span_id,
-        started_at_ns: monotonicNs(),
-        dispatch_id: dispatch.record_id,
-        name: input.tool,
-        implementation: process.env.NATIVE_REPLAY_OPENCODE_IDENTITY || "opencode:unknown",
-        arguments: output.args,
-        result_contract: recordedResultContract(input.tool),
-      })
-      reservations.set(input.callID, reservation)
-      if (input.tool === "task") {
-        const values = activeTasks.get(input.sessionID) || []
-        values.push(reservation)
-        activeTasks.set(input.sessionID, values)
-      }
+      await startTool(input.callID, input.tool, input.sessionID, output.args)
     },
     "tool.execute.after": async (input, output) => {
       const completion = await finish(input.callID, "ok", {

@@ -91,9 +91,7 @@ def _lane_stats(spans: list[dict[str, Any]]) -> dict[str, float | int | None]:
         "llm_count": len(llm),
         "tool_count": len(tools),
         "llm_busy_s": sum(float(span["end_s"]) - float(span["start_s"]) for span in llm),
-        "tool_busy_s": sum(
-            float(span["end_s"]) - float(span["start_s"]) for span in tools
-        ),
+        "tool_busy_s": sum(float(span["end_s"]) - float(span["start_s"]) for span in tools),
     }
 
 
@@ -101,13 +99,45 @@ def _rounded(
     stats: dict[str, float | int | None],
 ) -> dict[str, float | int | None]:
     return {
-        key: round(value, 6) if isinstance(value, float) else value
-        for key, value in stats.items()
+        key: round(value, 6) if isinstance(value, float) else value for key, value in stats.items()
     }
 
 
 def _short_actor(actor: str) -> str:
     return actor.split("-", 1)[0]
+
+
+def _actor_lanes(bundle: Bundle) -> dict[str, dict[str, Any]]:
+    return {
+        str(actor["actor_id"]): actor["lane"]
+        for actor in bundle.manifest["actors"]
+        if isinstance(actor.get("lane"), dict)
+    }
+
+
+def _display_actor(actor: str, actor_lanes: dict[str, dict[str, Any]]) -> str:
+    lane = actor_lanes.get(actor)
+    if not isinstance(lane, dict) or lane.get("concurrency_unit") != "coral-team":
+        return _short_actor(actor)
+    source = str(lane.get("source_task_id") or "")
+    task = source.rsplit("/", 1)[-1] if source else _short_actor(actor)
+    return (
+        f"S{int(lane['team_slot']):02d}/"
+        f"G{int(lane['slot_generation']):02d}/"
+        f"A{int(lane['agent_index'])}  {task}"
+    )
+
+
+def _work_actors(bundle: Bundle) -> list[str]:
+    window = bundle.manifest.get("concurrency_window")
+    if not isinstance(window, dict):
+        return bundle.actor_ids()
+    return [
+        str(actor)
+        for slot in window["slots"]
+        for attempt in slot["attempts"]
+        for actor in attempt["agent_actor_ids"]
+    ]
 
 
 def _tail_counts(
@@ -212,6 +242,7 @@ def _build_summary(
     actors: list[str],
 ) -> dict[str, Any]:
     llm_tails, tool_tails = _tail_counts(bundle.cutoff_tails)
+    actor_lanes = _actor_lanes(bundle)
     rows: list[dict[str, Any]] = []
     for index, actor in enumerate(actors, 1):
         stats = [_lane_stats(run["groups"].get(actor, [])) for run in runs]
@@ -225,6 +256,7 @@ def _build_summary(
         row: dict[str, Any] = {
             "lane": index,
             "actor_id": actor,
+            "label": _display_actor(actor, actor_lanes),
             "llm_count": reference["llm_count"],
             "tool_count": reference["tool_count"],
             "source_llm_tail_count": llm_tails.get(actor, 0),
@@ -242,24 +274,17 @@ def _build_summary(
         for row in rows
     ]
     replay_spread: dict[str, Any] = {
-        "makespan_s": _spread(
-            [float(metrics["makespan_seconds"]) for metrics in replay_metrics]
-        ),
-        "busy_span_s": _spread(
-            [float(metrics["busy_span_seconds"]) for metrics in replay_metrics]
-        ),
+        "makespan_s": _spread([float(metrics["makespan_seconds"]) for metrics in replay_metrics]),
+        "busy_span_s": _spread([float(metrics["busy_span_seconds"]) for metrics in replay_metrics]),
         "lane_wallclock_range_mean_s": round(statistics.fmean(lane_ranges), 6),
         "lane_wallclock_range_p95_s": round(_percentile(lane_ranges, 0.95), 6),
         "lane_wallclock_range_max_s": round(max(lane_ranges, default=0.0), 6),
     }
     if len(replay_names) == 2:
         first_name, second_name = replay_names
-        makespans = [
-            float(run["metrics"]["makespan_seconds"]) for run in runs[1:]
-        ]
+        makespans = [float(run["metrics"]["makespan_seconds"]) for run in runs[1:]]
         deltas = [
-            float(row[second_name]["wallclock_s"])
-            - float(row[first_name]["wallclock_s"])
+            float(row[second_name]["wallclock_s"]) - float(row[first_name]["wallclock_s"])
             for row in rows
         ]
         replay_spread["pairwise"] = {
@@ -282,9 +307,7 @@ def _build_summary(
     return {
         "schema_version": COMPARISON_SCHEMA,
         "definition": {
-            "lane_wallclock_s": (
-                "last closed LLM/tool end minus first closed LLM/tool start"
-            ),
+            "lane_wallclock_s": ("last closed LLM/tool end minus first closed LLM/tool start"),
             "closed_end_s": "last closed LLM/tool end since concurrency gate",
             "dispatch": "omitted because it wraps native tool execution",
             "browse_url": "composite scope only; excluded from filled spans and work counts",
@@ -391,7 +414,9 @@ def _plot_wallclock(
     formats: Sequence[str],
 ) -> dict[str, Path]:
     rows = summary["lanes"]
-    labels = [f"L{row['lane']:02d}  {_short_actor(row['actor_id'])}" for row in rows]
+    labels = [
+        f"L{row['lane']:02d}  {row.get('label', _short_actor(row['actor_id']))}" for row in rows
+    ]
     figure_height = max(9.2, 5.0 + 0.36 * len(rows) + 0.12 * len(runs))
     fig = plt.figure(figsize=(15.5, figure_height), facecolor="#fbfcfe")
     batch_weight = max(1.35, 0.42 * len(runs))
@@ -423,8 +448,7 @@ def _plot_wallclock(
     if len(replay_values) == 2:
         delta = replay_values[1] - replay_values[0]
         detail = (
-            f"Replay 2 − Replay 1 = {delta:+.3f}s"
-            f" ({100 * delta / replay_values[0]:+.2f}%)"
+            f"Replay 2 − Replay 1 = {delta:+.3f}s ({100 * delta / replay_values[0]:+.2f}%)"
             if replay_values[0]
             else f"Replay 2 − Replay 1 = {delta:+.3f}s"
         )
@@ -442,10 +466,7 @@ def _plot_wallclock(
     batch_axis.spines[["top", "right", "left"]].set_visible(False)
     batch_axis.tick_params(axis="y", length=0)
 
-    values = [
-        [float(row[run_name]["wallclock_s"]) for row in rows]
-        for run_name in run_names
-    ]
+    values = [[float(row[run_name]["wallclock_s"]) for row in rows] for run_name in run_names]
     y = list(range(len(rows)))
     for lane_index in y:
         lane_values = [value[lane_index] for value in values]
@@ -456,9 +477,7 @@ def _plot_wallclock(
             linewidth=1.2,
             zorder=1,
         )
-    for run_label, value, color, marker in zip(
-        run_labels, values, colors, markers, strict=True
-    ):
+    for run_label, value, color, marker in zip(run_labels, values, colors, markers, strict=True):
         lane_axis.scatter(
             value,
             y,
@@ -536,9 +555,10 @@ def _plot_timeline(
     actors: list[str],
     source_tails: dict[str, Any],
     formats: Sequence[str],
+    actor_lanes: dict[str, dict[str, Any]],
 ) -> dict[str, Path]:
     labels = [
-        f"L{index:02d}  {_short_actor(actor)}"
+        f"L{index:02d}  {_display_actor(actor, actor_lanes)}"
         for index, actor in enumerate(actors, 1)
     ]
     figure_height = max(9.0, 5.0 + 0.36 * len(actors))
@@ -552,9 +572,7 @@ def _plot_timeline(
     axes = list(raw_axes)
     max_window = max(float(run["metrics"]["makespan_seconds"]) for run in runs)
     actor_y = {actor: index for index, actor in enumerate(actors)}
-    for run_index, (axis, run_label, run) in enumerate(
-        zip(axes, run_labels, runs, strict=True)
-    ):
+    for run_index, (axis, run_label, run) in enumerate(zip(axes, run_labels, runs, strict=True)):
         axis.set_facecolor("#fbfcfe")
         for yi in range(len(actors)):
             if yi % 2 == 0:
@@ -565,6 +583,19 @@ def _plot_timeline(
                     alpha=0.75,
                     zorder=0,
                 )
+            if yi > 0:
+                current = actor_lanes.get(actors[yi], {})
+                previous = actor_lanes.get(actors[yi - 1], {})
+                current_group = (
+                    current.get("team_slot"),
+                    current.get("slot_generation"),
+                )
+                previous_group = (
+                    previous.get("team_slot"),
+                    previous.get("slot_generation"),
+                )
+                if current_group != previous_group:
+                    axis.axhline(yi - 0.5, color="#94A3B8", linewidth=0.8, zorder=1)
         for actor in actors:
             yi = actor_y[actor]
             for span in run["groups"].get(actor, []):
@@ -583,21 +614,37 @@ def _plot_timeline(
             gate = int(run["metrics"]["gate_at_ns"])
             end = float(run["metrics"]["makespan_seconds"])
             tails = [
-                (str(tail["actor_id"]), int(tail["started_at_ns"]))
+                (
+                    str(tail["actor_id"]),
+                    int(tail["started_at_ns"]),
+                    tail,
+                )
                 for tail in source_tails.get("llm_requests", [])
             ]
             tails.extend(
                 (
                     str(tail["actor_id"]),
                     int(tail.get("source_started_at_ns", tail.get("started_at_ns"))),
+                    tail,
                 )
                 for tail in source_tails.get("operations", [])
                 if tail.get("kind") == "tool"
             )
-            for actor, started_at_ns in tails:
+            for actor, started_at_ns, tail in tails:
                 start = (started_at_ns - gate) / 1e9
+                elapsed_ns = tail.get("elapsed_ns")
+                tail_end = (
+                    (started_at_ns + int(elapsed_ns) - gate) / 1e9
+                    if isinstance(elapsed_ns, int) and elapsed_ns >= 0
+                    else end
+                )
+                for key in ("interrupted_at_ns", "lane_terminated_at_ns"):
+                    upper = tail.get(key)
+                    if isinstance(upper, int):
+                        tail_end = min(tail_end, (upper - gate) / 1e9)
+                tail_end = max(start, min(tail_end, end))
                 axis.broken_barh(
-                    [(start, max(0.001, end - start))],
+                    [(start, max(0.001, tail_end - start))],
                     (actor_y[actor] - 0.31, 0.62),
                     facecolors="none",
                     edgecolors="#DC2626",
@@ -705,9 +752,7 @@ def _default_label(bundle: Bundle) -> str:
 
 
 def _default_prefix(bundle: Bundle, replay_count: int) -> str:
-    concurrency = bundle.manifest["workload"].get(
-        "concurrency", len(bundle.manifest["actors"])
-    )
+    concurrency = bundle.manifest["workload"].get("concurrency", len(bundle.manifest["actors"]))
     replay_word = "replay" if replay_count == 1 else "replays"
     raw = f"{bundle.adapter}-c{concurrency}-record-{replay_count}-{replay_word}"
     return re.sub(r"[^a-zA-Z0-9._-]+", "-", raw).strip("-").lower()
@@ -739,8 +784,8 @@ def render_comparison(
             for index, root in enumerate(run_dirs, 1)
         ),
     ]
-    actors = bundle.actor_ids()
-    declared = set(actors)
+    actors = _work_actors(bundle)
+    declared = set(bundle.actor_ids())
     for run in runs:
         unknown_actors = sorted(set(run["groups"]) - declared)
         require(
@@ -749,10 +794,7 @@ def render_comparison(
         )
         observed_counts = {
             kind: sum(
-                1
-                for spans in run["groups"].values()
-                for span in spans
-                if span["lane"] == kind
+                1 for spans in run["groups"].values() for span in spans if span["lane"] == kind
             )
             for kind in ("llm", "tool")
         }
@@ -763,18 +805,16 @@ def render_comparison(
                 f"expected {bundle.manifest['counts'][kind]}",
             )
 
-    actors.sort(
-        key=lambda actor: (
-            min(
-                (
-                    float(span["start_s"])
-                    for span in runs[0]["groups"].get(actor, [])
+    if not isinstance(bundle.manifest.get("concurrency_window"), dict):
+        actors.sort(
+            key=lambda actor: (
+                min(
+                    (float(span["start_s"]) for span in runs[0]["groups"].get(actor, [])),
+                    default=math.inf,
                 ),
-                default=math.inf,
-            ),
-            actor,
+                actor,
+            )
         )
-    )
     run_names = _run_names(len(run_dirs))
     run_labels = _run_labels(runs)
     summary = _build_summary(
@@ -819,17 +859,12 @@ def render_comparison(
         actors=actors,
         source_tails=bundle.cutoff_tails,
         formats=selected_formats,
+        actor_lanes=_actor_lanes(bundle),
     )
     return {
         "summary": str(summary_path),
         "csv": str(csv_path),
-        "wallclock": {
-            output_format: str(path)
-            for output_format, path in wallclock_paths.items()
-        },
-        "timeline": {
-            output_format: str(path)
-            for output_format, path in timeline_paths.items()
-        },
+        "wallclock": {output_format: str(path) for output_format, path in wallclock_paths.items()},
+        "timeline": {output_format: str(path) for output_format, path in timeline_paths.items()},
         "replay_spread": summary["replay_spread"],
     }

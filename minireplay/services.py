@@ -70,19 +70,13 @@ class ReplayServices:
             llm_index=self.llm,
             fast_claim=fast_claim,
         )
-        terminal_actors: set[str] = set()
-        if bundle is not None:
-            for terminal in bundle.terminal.get("task_terminals", []):
-                actor_id = terminal.get("actor_id") if isinstance(terminal, dict) else None
-                if isinstance(actor_id, str):
-                    terminal_actors.add(actor_id)
         tail_actors = {
             str(entry["actor_id"])
             for section in ("operations", "llm_requests")
             for entry in (bundle.cutoff_tails.get(section, []) if bundle is not None else [])
         }
         self._cutoff_actors = (
-            (set(bundle.actor_ids()) - terminal_actors) | tail_actors
+            bundle.cutoff_actor_ids() | tail_actors
             if bundle is not None
             else set()
         )

@@ -17,6 +17,8 @@ from pathlib import Path
 
 from .config import RunConfig
 
+DEFAULT_WARMUP_S = 15
+
 # A unix socket path is capped at ~108 bytes, and tmux puts its socket at
 # ``$TMUX_TMPDIR/tmux-<uid>/default``. A run directory deep enough to overflow that
 # fails inside the framework's own launcher ("error connecting to ... File name too
@@ -67,6 +69,20 @@ def sweep_command(config: RunConfig, *, duration_s: int | None = None) -> tuple[
             str(config.duration_s if duration_s is None else duration_s),
         ]
     )
+    if config.framework == "coral":
+        command.extend(
+            [
+                "--agent-turns",
+                str(config.coral_agent_turns),
+                "--global-turns",
+                str(config.coral_global_turns),
+                (
+                    "--restart-exited"
+                    if config.coral_restart_exited
+                    else "--no-restart-exited"
+                ),
+            ]
+        )
     return tuple(command)
 
 
@@ -90,7 +106,7 @@ def native_command(
         # gate. The native sweep resets prefix/KV state both before and after this
         # traffic, so kernels and execution paths are hot without leaving warmup
         # prompts in the measured cache. Tool-only replay has no vLLM to warm.
-        "SWEEP_WARMUP": "15" if warm_vllm else "0",
+        "SWEEP_WARMUP": str(DEFAULT_WARMUP_S) if warm_vllm else "0",
         "SWEEP_RANDOM_WARMUP": "1" if warm_vllm else "0",
         "SWEEP_WARMUP_CONCURRENCY": "8",
         "SWEEP_LABEL_TS": "0",

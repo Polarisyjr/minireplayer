@@ -79,10 +79,15 @@ def test_claim_is_independent_across_actors(tmp_path: Path) -> None:
 def test_coral_sessions_are_separate_lanes(tmp_path: Path) -> None:
     """One CORAL actor runs concurrent sessions; they must not order each other."""
 
-    root = dispatch(dispatch_id="d-root", session_id="s/root", arguments={"n": "root"},
-                    execution_call_id=None)
-    child = dispatch(dispatch_id="d-child", session_id="s/root/child", arguments={"n": "child"},
-                     execution_call_id=None)
+    root = dispatch(
+        dispatch_id="d-root", session_id="s/root", arguments={"n": "root"}, execution_call_id=None
+    )
+    child = dispatch(
+        dispatch_id="d-child",
+        session_id="s/root/child",
+        arguments={"n": "child"},
+        execution_call_id=None,
+    )
     led = ledger(tmp_path, make_bundle(dispatches=[child, root], tools=[]), adapter="coral")
 
     def start_dispatch(session: str, name: str) -> dict:
@@ -199,6 +204,165 @@ def test_interleaved_cutoff_lane_is_held_before_native_entry(tmp_path: Path) -> 
         led.start(payload("tail"))
     # Holding the truncated branch must not consume or block its closed sibling.
     assert led.start(payload("closed"))["record_id"] == "d-closed"
+
+
+def test_pre_dispatch_cutoff_matches_provider_call_id_before_argument_mapping(
+    tmp_path: Path,
+) -> None:
+    marker = dispatch(
+        dispatch_id="predispatch-call-shell",
+        name="bash",
+        arguments={"command": "echo captured"},
+        execution_call_id=None,
+        started=200,
+        ended=200,
+    )
+    marker.update(
+        {
+            "cutoff_truncated": True,
+            "pre_dispatch": True,
+            "replay_entry": "block-before-entry",
+            "kind": "dispatch",
+            "record_id": "predispatch-call-shell",
+            "native_call_id": "call-shell",
+            "causal_lane": "model-call:call-shell",
+            "source_started_at_ns": 200,
+            "elapsed_ns": 0,
+        }
+    )
+    marker["origin"]["model_call_id"] = "call-shell"
+    led = ledger(
+        tmp_path,
+        make_bundle(
+            dispatches=[],
+            tools=[],
+            cutoff_tails={"operations": [marker], "llm_requests": []},
+        ),
+    )
+    live_dispatch = {
+        "kind": "dispatch",
+        "actor_id": "actor-0",
+        "process_role": "mini-swe-agent",
+        "started_at_ns": 300,
+        "parser_identity": "minisweagent.DefaultAgent.execute_actions",
+        "dispatcher_identity": "minisweagent.DockerEnvironment.execute",
+        "native_call_id": "call-shell",
+        "name": "docker.exec",
+        "arguments": {
+            "action": {
+                "command": "echo captured",
+                "tool_call_id": "call-shell",
+            },
+            "cwd": "",
+            "timeout": None,
+        },
+        "causal_lane": "model-call:call-shell",
+        "origin": {
+            "kind": "llm_structured",
+            "trigger_id": "llm-0",
+            "model_call_id": "call-shell",
+        },
+    }
+
+    with pytest.raises(WorkloadComplete, match="source cutoff tail"):
+        led.start(live_dispatch)
+
+
+def test_composite_task_cutoff_enters_and_withholds_parent_result(tmp_path: Path) -> None:
+    lane = "model-call:call-task"
+    arguments = {"description": "research"}
+    dispatch_tail = dispatch(
+        dispatch_id="d-task",
+        name="task",
+        arguments=arguments,
+        execution_call_id=None,
+        session_id="root",
+        started=200,
+        ended=300,
+    )
+    dispatch_tail.update(
+        {
+            "cutoff_truncated": True,
+            "kind": "dispatch",
+            "record_id": "d-task",
+            "native_call_id": "call-task",
+            "causal_lane": lane,
+            "source_started_at_ns": 200,
+            "elapsed_ns": 0,
+            "replay_entry": "enter-and-preserve-descendants",
+        }
+    )
+    dispatch_tail["origin"]["model_call_id"] = "call-task"
+    tool_tail = tool(
+        call_id="tool-task",
+        dispatch_id="d-task",
+        causal_lane=lane,
+        name="task",
+        arguments=arguments,
+    )
+    tool_tail.update(
+        {
+            "cutoff_truncated": True,
+            "kind": "tool",
+            "record_id": "tool-task",
+            "source_started_at_ns": 210,
+            "elapsed_ns": 0,
+            "replay_entry": "enter-and-preserve-descendants",
+        }
+    )
+    led = ledger(
+        tmp_path,
+        make_bundle(
+            dispatches=[],
+            tools=[],
+            cutoff_tails={
+                "operations": [dispatch_tail, tool_tail],
+                "llm_requests": [],
+            },
+        ),
+        adapter="coral",
+    )
+
+    dispatch_reservation = led.start(
+        {
+            "kind": "dispatch",
+            "actor_id": "actor-0",
+            "session_id": "root",
+            "process_role": "coral-opencode",
+            "started_at_ns": 600,
+            "parser_identity": "parser",
+            "dispatcher_identity": "dispatcher",
+            "native_call_id": "call-task",
+            "name": "task",
+            "arguments": arguments,
+            "origin": {
+                "kind": "llm_structured",
+                "trigger_id": "llm-0",
+                "model_call_id": "call-task",
+            },
+        }
+    )
+    assert dispatch_reservation["record_id"] == "d-task"
+    tool_reservation = led.start(
+        start_tool(
+            dispatch_id="d-task",
+            causal_lane=lane,
+            name="task",
+            arguments=arguments,
+        )
+    )
+    assert tool_reservation["record_id"] == "tool-task"
+    completion = led.complete(
+        {
+            "reservation_id": tool_reservation["reservation_id"],
+            "ended_at_ns": 700,
+            "status": "ok",
+            "result": {"output": "child result the source never observed"},
+            "native_execution": True,
+        }
+    )
+    assert completion["_hold_for_cutoff"] is True
+    assert led.expected_complete() is True
 
 
 def test_closed_prefix_precedes_identical_cutoff_tail_in_same_lane(tmp_path: Path) -> None:

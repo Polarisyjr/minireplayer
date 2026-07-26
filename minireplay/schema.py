@@ -191,9 +191,7 @@ def validate_llm(value: dict[str, Any]) -> None:
         try:
             decoded_request = json.loads(ordered_request)
         except json.JSONDecodeError as exc:
-            raise ValidationError(
-                f"llm.request_ordered_json: malformed JSON: {exc}"
-            ) from exc
+            raise ValidationError(f"llm.request_ordered_json: malformed JSON: {exc}") from exc
         require(
             isinstance(decoded_request, dict) and decoded_request == value["request"],
             "llm.request_ordered_json: ordered request does not match request",
@@ -255,6 +253,116 @@ def validate_manifest(value: dict[str, Any]) -> None:
         require(actor_id in actor_ids, f"manifest.lanes: undeclared actor {actor_id!r}")
         require(actor_id not in lane_ids, f"manifest.lanes: duplicate actor {actor_id!r}")
         lane_ids.add(actor_id)
+    concurrency_window = value.get("concurrency_window")
+    if concurrency_window is not None:
+        window_entry = _object(concurrency_window, "manifest.concurrency_window")
+        require(
+            window_entry.get("unit") == "coral-team",
+            "manifest.concurrency_window.unit: expected coral-team",
+        )
+        size = window_entry.get("size")
+        team_size = window_entry.get("team_size")
+        require(
+            isinstance(size, int) and not isinstance(size, bool) and size > 0,
+            "manifest.concurrency_window.size: expected a positive integer",
+        )
+        require(
+            team_size == 4,
+            "manifest.concurrency_window.team_size: expected four",
+        )
+        require(
+            window_entry.get("target_agent_lanes") == size * team_size,
+            "manifest.concurrency_window.target_agent_lanes: inconsistent window",
+        )
+        require(
+            window_entry.get("refill_unit") == "whole-team",
+            "manifest.concurrency_window.refill_unit: expected whole-team",
+        )
+        slots = window_entry.get("slots")
+        require(
+            isinstance(slots, list) and len(slots) == size,
+            "manifest.concurrency_window.slots: expected one entry per team slot",
+        )
+        topology_actors: set[str] = set()
+        for expected_slot, raw_slot in enumerate(slots):
+            slot = _object(raw_slot, "manifest.concurrency_window.slots[]")
+            require(
+                slot.get("team_slot") == expected_slot,
+                "manifest.concurrency_window.slots: team slots must be ordered",
+            )
+            attempts = slot.get("attempts")
+            require(
+                isinstance(attempts, list) and bool(attempts),
+                "manifest.concurrency_window.slots[].attempts: expected a non-empty list",
+            )
+            for generation, raw_attempt in enumerate(attempts):
+                attempt = _object(
+                    raw_attempt,
+                    "manifest.concurrency_window.slots[].attempts[]",
+                )
+                require(
+                    attempt.get("team_slot") == expected_slot
+                    and attempt.get("slot_generation") == generation,
+                    "manifest.concurrency_window: invalid slot generation",
+                )
+                parent = _string(
+                    attempt.get("team_actor_id"),
+                    "manifest.concurrency_window.team_actor_id",
+                )
+                members = attempt.get("agent_actor_ids")
+                require(
+                    isinstance(members, list) and len(members) == team_size,
+                    "manifest.concurrency_window.agent_actor_ids: expected four lanes",
+                )
+                group = [parent, *members]
+                require(
+                    all(isinstance(actor, str) and actor in actor_ids for actor in group),
+                    "manifest.concurrency_window: undeclared actor",
+                )
+                require(
+                    not topology_actors.intersection(group),
+                    "manifest.concurrency_window: actor appears in multiple team attempts",
+                )
+                topology_actors.update(group)
+        require(
+            topology_actors == actor_ids,
+            "manifest.concurrency_window: topology does not cover every actor",
+        )
+        controls = value.get("coral_controls", [])
+        require(isinstance(controls, list), "manifest.coral_controls: expected a list")
+        seen_controls: set[tuple[str, int]] = set()
+        for raw_control in controls:
+            control = _object(raw_control, "manifest.coral_controls[]")
+            actor_id = _string(
+                control.get("actor_id"),
+                "manifest.coral_controls[].actor_id",
+            )
+            _string(control.get("agent_id"), "manifest.coral_controls[].agent_id")
+            invocation_index = control.get("invocation_index")
+            require(
+                isinstance(invocation_index, int)
+                and not isinstance(invocation_index, bool)
+                and invocation_index > 0,
+                "manifest.coral_controls[].invocation_index: expected a positive integer",
+            )
+            _string(control.get("source"), "manifest.coral_controls[].source")
+            _string(control.get("prompt"), "manifest.coral_controls[].prompt")
+            trigger = control.get("trigger_grader_attempt_id")
+            require(
+                trigger is None or isinstance(trigger, str),
+                "manifest.coral_controls[].trigger_grader_attempt_id: "
+                "expected a string or null",
+            )
+            key = (actor_id, invocation_index)
+            require(
+                actor_id in actor_ids,
+                f"manifest.coral_controls: undeclared actor {actor_id!r}",
+            )
+            require(
+                key not in seen_controls,
+                f"manifest.coral_controls: duplicate control {key!r}",
+            )
+            seen_controls.add(key)
     window = _object(value.get("window"), "manifest.window")
     for field in ("gate_at_ns", "terminal_at_ns"):
         require(
@@ -272,6 +380,7 @@ def validate_causal_graph(
     spans: list[dict[str, Any]],
     dispatches: list[dict[str, Any]],
     tools: list[dict[str, Any]],
+    open_parent_span_ids: set[str] | None = None,
 ) -> None:
     """Check that the closed prefix really is closed.
 
@@ -281,10 +390,11 @@ def validate_causal_graph(
     """
 
     span_ids = {span["span_id"] for span in spans}
+    valid_parent_ids = span_ids | set(open_parent_span_ids or ())
     for span in spans:
         parent = span.get("parent_span_id")
         require(
-            parent is None or parent in span_ids,
+            parent is None or parent in valid_parent_ids,
             f"span {span['span_id']}: parent {parent} is not in the bundle",
         )
 

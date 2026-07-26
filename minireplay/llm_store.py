@@ -39,6 +39,7 @@ from .forced import (
     replay_audit_request_id,
     sign_capture,
 )
+from .replay_control import mark_session_prefix_consumed
 from .util import append_jsonl, monotonic_ns, require, sha256_json
 
 # Response fields the engine regenerates per call. They are recorded as evidence
@@ -291,6 +292,12 @@ class LLMStore:
             lane_complete = bool(queue) and all(
                 str(record["attempt_id"]) in self._delivered for record in queue
             )
+            if lane_complete:
+                mark_session_prefix_consumed(
+                    self.stage_dir.parent,
+                    identity.actor_id,
+                    identity.session_id,
+                )
             if whole_run_complete or actor_complete or lane_complete:
                 raise WorkloadComplete(
                     f"LLM request for {key} arrived after the recorded window closed"

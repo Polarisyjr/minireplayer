@@ -17,6 +17,11 @@ from .constants import CONFIG_SCHEMA, SUPPORTED_ADAPTERS
 from .util import read_json, require
 
 LEGACY_LOAD_MODELS = {"steady": True, "fire-once": False}
+DEFAULT_DURATION_S = 180
+CORAL_TEAM_SIZE = 4
+CORAL_AGENT_TURNS = 100
+CORAL_GLOBAL_TURNS = 10
+CORAL_RESTART_EXITED = True
 
 # Only these keys may differ between the run that produced a bundle and a run
 # that replays it. Everything else is workload identity and must match.
@@ -33,6 +38,12 @@ class RunConfig:
     targets: dict[str, str]
     env: dict[str, str] = field(default_factory=dict)
     coral_dataset: str = "frontier_cs_algo"
+    # CORAL has two distinct turn budgets. ``agent_turns`` counts OpenCode
+    # ``step_finish`` records inside one invocation. ``global_turns`` counts
+    # invocations across the four-agent team, including the initial four.
+    coral_agent_turns: int = CORAL_AGENT_TURNS
+    coral_global_turns: int = CORAL_GLOBAL_TURNS
+    coral_restart_exited: bool = CORAL_RESTART_EXITED
     # Whether a completed actor is replaced with the next task in seeded order.
     # This is one workload dimension shared by every framework.
     refill: bool = True
@@ -46,6 +57,10 @@ class RunConfig:
     def adapter(self) -> str:
         return self.framework
 
+    @property
+    def coral_team_size(self) -> int:
+        return CORAL_TEAM_SIZE
+
     def workload_identity(self) -> dict[str, Any]:
         """The part of the config a replay must reproduce exactly."""
 
@@ -57,7 +72,12 @@ class RunConfig:
             "refill": self.refill,
         }
         if self.framework == "coral":
+            identity["concurrency_unit"] = "coral-team"
+            identity["coral_team_size"] = self.coral_team_size
             identity["coral_dataset"] = self.coral_dataset
+            identity["coral_agent_turns"] = self.coral_agent_turns
+            identity["coral_global_turns"] = self.coral_global_turns
+            identity["coral_restart_exited"] = self.coral_restart_exited
         return identity
 
     def to_json(self) -> dict[str, Any]:
@@ -71,6 +91,10 @@ class RunConfig:
             "targets": dict(self.targets),
             "env": dict(self.env),
             "coral_dataset": self.coral_dataset,
+            "coral_team_size": self.coral_team_size,
+            "coral_agent_turns": self.coral_agent_turns,
+            "coral_global_turns": self.coral_global_turns,
+            "coral_restart_exited": self.coral_restart_exited,
             "refill": self.refill,
             "results_root": self.results_root,
             "cpuset": self.cpuset,
@@ -185,16 +209,43 @@ def load_config(path: Path) -> RunConfig:
         else raw.get("refill", True)
     )
     require(isinstance(refill, bool), "config.refill must be a boolean")
+    coral_restart_exited = raw.get("coral_restart_exited", CORAL_RESTART_EXITED)
+    require(
+        isinstance(coral_restart_exited, bool),
+        "config.coral_restart_exited must be a boolean",
+    )
+    coral_team_size = raw.get("coral_team_size", CORAL_TEAM_SIZE)
+    require(
+        framework != "coral" or coral_team_size == CORAL_TEAM_SIZE,
+        f"config.coral_team_size must be {CORAL_TEAM_SIZE}",
+    )
+    coral_agent_turns = _int(
+        raw.get("coral_agent_turns", CORAL_AGENT_TURNS),
+        "coral_agent_turns",
+        minimum=1,
+    )
+    coral_global_turns = _int(
+        raw.get("coral_global_turns", CORAL_GLOBAL_TURNS),
+        "coral_global_turns",
+        minimum=0,
+    )
+    require(
+        framework != "coral" or coral_global_turns == 0 or coral_global_turns >= 4,
+        "config.coral_global_turns must be 0 or at least the four initial CORAL agents",
+    )
 
     return RunConfig(
         framework=str(framework),
         repo=repo.resolve(),
         concurrency=_int(raw.get("concurrency"), "concurrency", minimum=1),
-        duration_s=_int(raw.get("duration_s", 1200), "duration_s", minimum=1),
+        duration_s=_int(raw.get("duration_s", DEFAULT_DURATION_S), "duration_s", minimum=1),
         seed=_int(raw.get("seed", 42), "seed", minimum=0),
         targets={str(k): str(v) for k, v in targets.items()},
         env={str(k): str(v) for k, v in env.items()},
         coral_dataset=str(raw.get("coral_dataset", "frontier_cs_algo")),
+        coral_agent_turns=coral_agent_turns,
+        coral_global_turns=coral_global_turns,
+        coral_restart_exited=coral_restart_exited,
         refill=refill,
         results_root=results_root,
         cpuset=cpuset,

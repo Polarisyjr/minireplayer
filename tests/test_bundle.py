@@ -6,8 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from minireplay.bundle import build_bundle, load_bundle
+from minireplay.bundle import (
+    build_bundle,
+    load_bundle,
+    materialize_pre_dispatch_tails,
+)
 from minireplay.constants import TERMINAL_SCHEMA
+from minireplay.cutoff import close_stage_at_cutoff
 from minireplay.errors import ValidationError
 from minireplay.util import append_jsonl, sha256_json
 from tests.support import ZERO, artifact, dispatch, llm, span, tool
@@ -16,8 +21,14 @@ from tests.support import ZERO, artifact, dispatch, llm, span, tool
 def stage(tmp_path: Path, **records) -> Path:
     root = tmp_path / "stage"
     root.mkdir()
-    for relative in ("llm.jsonl", "spans.jsonl", "dispatches.jsonl", "tools.jsonl",
-                     "graders.jsonl", "artifacts.jsonl"):
+    for relative in (
+        "llm.jsonl",
+        "spans.jsonl",
+        "dispatches.jsonl",
+        "tools.jsonl",
+        "graders.jsonl",
+        "artifacts.jsonl",
+    ):
         (root / relative).touch()
     for relative, entries in records.items():
         for entry in entries:
@@ -25,17 +36,25 @@ def stage(tmp_path: Path, **records) -> Path:
     return root
 
 
-def build(tmp_path: Path, stage_dir: Path, *, actors=None, name="bundle"):
+def build(
+    tmp_path: Path,
+    stage_dir: Path,
+    *,
+    actors=None,
+    name="bundle",
+    adapter="mini-swe",
+    cutoff_tails=None,
+):
     return build_bundle(
         stage_dir=stage_dir,
         output=tmp_path / name,
         bundle_id="test",
-        adapter="mini-swe",
+        adapter=adapter,
         workload={"framework": "mini-swe", "concurrency": 1, "duration_s": 60, "seed": 42},
         actors=actors or [{"actor_id": "actor-0", "source_actor_id": "inst-1"}],
         window={"gate_at_ns": 0, "terminal_at_ns": 1000},
         terminal={"schema_version": TERMINAL_SCHEMA, "status": "success", "task_terminals": []},
-        cutoff_tails={"operations": [], "llm_requests": []},
+        cutoff_tails=cutoff_tails or {"operations": [], "llm_requests": []},
     )
 
 
@@ -51,7 +70,11 @@ def test_round_trip(tmp_path: Path) -> None:
     )
     bundle = build(tmp_path, stage_dir)
     assert bundle.manifest["counts"] == {
-        "llm": 1, "dispatch": 1, "tool": 1, "grader": 0, "artifact": 0,
+        "llm": 1,
+        "dispatch": 1,
+        "tool": 1,
+        "grader": 0,
+        "artifact": 0,
     }
     assert bundle.actor_map() == {"inst-1": "actor-0"}
     assert bundle.manifest["schema_version"] == "minireplay.manifest/v2"
@@ -81,6 +104,31 @@ def test_actor_map_maps_refill_tasks_to_their_worker_lane(tmp_path: Path) -> Non
     )
 
     assert bundle.actor_map() == {"inst-1": "actor-0", "inst-9": "actor-0"}
+
+
+def test_refill_source_without_terminal_marks_lane_open_at_cutoff(tmp_path: Path) -> None:
+    stage_dir = stage(tmp_path, **{"llm.jsonl": [llm()]})
+    bundle = build(
+        tmp_path,
+        stage_dir,
+        actors=[
+            {
+                "actor_id": "actor-0",
+                "source_actor_id": "initial",
+                "source_actor_ids": ["initial", "refill"],
+            }
+        ],
+    )
+    bundle.terminal["task_terminals"] = [
+        {
+            "actor_id": "actor-0",
+            "status": "success",
+            "task": {"source_actor_id": "initial"},
+        }
+    ]
+
+    assert bundle.cutoff_source_actor_ids() == {"refill"}
+    assert bundle.cutoff_actor_ids() == {"actor-0"}
 
 
 def test_load_rejects_a_dangling_tool(tmp_path: Path) -> None:
@@ -176,10 +224,21 @@ def test_artifact_read_must_match_its_producer(tmp_path: Path) -> None:
             "dispatches.jsonl": [],
             "tools.jsonl": [],
             "artifacts.jsonl": [
-                artifact(event_id="a-write", operation="create", version=1, digest=ZERO,
-                         completed_at_ns=100),
-                artifact(event_id="a-read", operation="read", version=1, digest=other,
-                         read_from="a-write", completed_at_ns=200),
+                artifact(
+                    event_id="a-write",
+                    operation="create",
+                    version=1,
+                    digest=ZERO,
+                    completed_at_ns=100,
+                ),
+                artifact(
+                    event_id="a-read",
+                    operation="read",
+                    version=1,
+                    digest=other,
+                    read_from="a-write",
+                    completed_at_ns=200,
+                ),
             ],
         },
     )
@@ -195,9 +254,7 @@ def test_artifact_versions_must_be_monotonic(tmp_path: Path) -> None:
             "tools.jsonl": [],
             "artifacts.jsonl": [
                 artifact(event_id="a-1", version=1, completed_at_ns=100),
-                artifact(
-                    event_id="a-3", operation="write", version=3, completed_at_ns=200
-                ),
+                artifact(event_id="a-3", operation="write", version=3, completed_at_ns=200),
             ],
         },
     )
@@ -229,8 +286,12 @@ def test_cutoff_tail_must_declare_its_duration(tmp_path: Path) -> None:
             terminal={"schema_version": TERMINAL_SCHEMA, "status": "success", "task_terminals": []},
             cutoff_tails={
                 "operations": [
-                    {"cutoff_truncated": True, "kind": "tool", "record_id": "t",
-                     "actor_id": "actor-0"}
+                    {
+                        "cutoff_truncated": True,
+                        "kind": "tool",
+                        "record_id": "t",
+                        "actor_id": "actor-0",
+                    }
                 ],
                 "llm_requests": [],
             },
@@ -280,3 +341,244 @@ def test_digest_helper_is_the_one_the_claim_uses() -> None:
     arguments = {"command": "echo hi", "cwd": "/w"}
     record = tool(arguments=arguments)
     assert claim_identity("tool", record) == ("shell", sha256_json(arguments))
+
+
+def test_coral_materializes_pre_dispatch_cutoff_for_completed_llm(
+    tmp_path: Path,
+) -> None:
+    response = {
+        "chunks": [
+            {
+                "done": False,
+                "payload": {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "id": "call-task",
+                                        "index": 0,
+                                        "type": "function",
+                                        "function": {
+                                            "name": "task",
+                                            "arguments": '{"description":"research"}',
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+            },
+            {"done": True},
+        ]
+    }
+    stage_dir = stage(tmp_path, **{"llm.jsonl": [llm(response=response, stream=True)]})
+
+    bundle = build(tmp_path, stage_dir, adapter="coral")
+
+    assert len(bundle.cutoff_tails["operations"]) == 1
+    marker = bundle.cutoff_tails["operations"][0]
+    assert marker["pre_dispatch"] is True
+    assert marker["replay_entry"] == "block-before-entry"
+    assert marker["kind"] == "dispatch"
+    assert marker["native_call_id"] == "call-task"
+    assert marker["name"] == "task"
+    assert marker["arguments"] == {"description": "research"}
+    assert marker["elapsed_ns"] == 0
+
+
+@pytest.mark.parametrize("adapter", ["mini-swe", "owl"])
+def test_pre_dispatch_cutoff_is_adapter_independent(
+    tmp_path: Path,
+    adapter: str,
+) -> None:
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "id": "call-shell",
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": '{"command":"echo captured"}',
+                            },
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    stage_dir = stage(tmp_path, **{"llm.jsonl": [llm(response=response)]})
+
+    bundle = build(tmp_path, stage_dir, adapter=adapter)
+
+    assert len(bundle.llm) == 1
+    assert len(bundle.cutoff_tails["operations"]) == 1
+    marker = bundle.cutoff_tails["operations"][0]
+    assert marker["pre_dispatch"] is True
+    assert marker["replay_entry"] == "block-before-entry"
+    assert marker["causal_lane"] == "model-call:call-shell"
+    assert marker["native_call_id"] == "call-shell"
+
+
+def test_coral_materialized_task_tail_preserves_completed_child_work(
+    tmp_path: Path,
+) -> None:
+    response = {
+        "id": "chatcmpl-parent",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-task",
+                            "type": "function",
+                            "function": {
+                                "name": "task",
+                                "arguments": '{"description":"research"}',
+                            },
+                        }
+                    ],
+                }
+            }
+        ],
+    }
+    parent = llm(
+        attempt_id="llm-parent",
+        session_id="actor-0/invocation-0/root-0",
+        response=response,
+    )
+    child = llm(
+        attempt_id="llm-child",
+        session_id="actor-0/invocation-0/root-0/child-0",
+        role="coral-subagent",
+    )
+    child["started_at_ns"] = 30
+    child["ended_at_ns"] = 40
+    child["parent_span_id"] = "span-open-task-tool"
+    stage_dir = stage(
+        tmp_path,
+        **{
+            "llm.jsonl": [parent, child],
+            "spans.jsonl": [
+                {
+                    **span(parent["span_id"]),
+                    "kind": "llm",
+                    "name": "llm:coral-agent",
+                },
+                {
+                    **span(child["span_id"], parent="span-open-task-tool"),
+                    "kind": "llm",
+                    "name": "llm:coral-subagent",
+                },
+            ],
+        },
+    )
+    tails = materialize_pre_dispatch_tails(
+        adapter="coral",
+        llm=[parent, child],
+        dispatches=[],
+        cutoff_tails={"operations": [], "llm_requests": []},
+    )
+
+    task_tails = [record for record in tails["operations"] if record["name"] == "task"]
+    assert [record["kind"] for record in task_tails] == ["dispatch", "tool"]
+    assert all(
+        record["replay_entry"] == "enter-and-preserve-descendants"
+        for record in task_tails
+    )
+    assert task_tails[1]["span_id"] == "span-open-task-tool"
+
+    close_stage_at_cutoff(stage_dir, cutoff_tails=tails)
+    bundle = build(
+        tmp_path,
+        stage_dir,
+        adapter="coral",
+        cutoff_tails=tails,
+    )
+
+    assert [record["attempt_id"] for record in bundle.llm] == [
+        "llm-parent",
+        "llm-child",
+    ]
+
+
+def test_coral_accepts_a_model_tool_call_with_rejected_dispatch_evidence(
+    tmp_path: Path,
+) -> None:
+    response = {
+        "id": "chatcmpl-1",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-task",
+                            "type": "function",
+                            "function": {"name": "task", "arguments": "{}"},
+                        }
+                    ],
+                }
+            }
+        ],
+    }
+    rejected = dispatch(
+        dispatch_id="dispatch-task",
+        name="task",
+        arguments={},
+        execution_call_id=None,
+    )
+    rejected["native_call_id"] = "call-task"
+    rejected["origin"]["model_call_id"] = "call-task"
+    stage_dir = stage(
+        tmp_path,
+        **{"llm.jsonl": [llm(response=response)], "dispatches.jsonl": [rejected]},
+    )
+
+    bundle = build(tmp_path, stage_dir, adapter="coral")
+
+    assert bundle.dispatches == [rejected]
+
+
+def test_composite_cutoff_parent_closes_the_saved_child_span(
+    tmp_path: Path,
+) -> None:
+    child = llm(attempt_id="llm-child", role="coral-subagent")
+    child_span = {
+        **span(child["span_id"], parent="span-task-cutoff"),
+        "kind": "llm",
+        "name": "llm:coral-subagent",
+    }
+    stage_dir = stage(
+        tmp_path,
+        **{"llm.jsonl": [child], "spans.jsonl": [child_span]},
+    )
+    tail = {
+        "cutoff_truncated": True,
+        "kind": "tool",
+        "record_id": "tool-task-cutoff",
+        "call_id": "tool-task-cutoff",
+        "span_id": "span-task-cutoff",
+        "actor_id": "actor-0",
+        "causal_lane": "model-call:call-task",
+        "name": "task",
+        "arguments": {"description": "research"},
+        "arguments_sha256": sha256_json({"description": "research"}),
+        "source_started_at_ns": 5,
+        "elapsed_ns": 10,
+        "replay_entry": "enter-and-preserve-descendants",
+    }
+
+    bundle = build(
+        tmp_path,
+        stage_dir,
+        cutoff_tails={"operations": [tail], "llm_requests": []},
+    )
+
+    assert bundle.llm == [child]
+    assert bundle.spans == [child_span]

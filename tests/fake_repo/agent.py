@@ -84,7 +84,10 @@ def main() -> int:
             invoke=invoke,
         )
 
-    report_task_terminal(result={"calls": TOOL_CALLS}, status="success")
+    report_task_terminal(
+        result={"calls": TOOL_CALLS},
+        status=os.environ.get("FAKE_AGENT_TERMINAL_STATUS", "success"),
+    )
     return 0
 
 

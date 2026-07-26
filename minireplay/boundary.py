@@ -35,7 +35,15 @@ from .constants import (
     SPAN_SCHEMA,
     TOOL_SCHEMA,
 )
-from .contracts import bind_typed_fields, run_path_map, to_physical
+from .contracts import (
+    bind_typed_fields,
+    rebind_embedded_coral_paths,
+    recorded_path_map,
+    recorded_workspace_path_map,
+    restore_embedded_coral_source_paths,
+    run_path_map,
+    to_physical,
+)
 from .errors import MismatchError, ValidationError, WorkloadComplete
 from .observation import project_result, validate_result_contract
 from .util import append_jsonl, atomic_write_json, monotonic_ns, require, sha256_json
@@ -145,6 +153,7 @@ class BoundaryLedger:
         self._completed: set[tuple[str, str]] = set()
         self._delivered: set[tuple[str, str]] = set()
         self._lane_of_record: dict[str, str | None] = {}
+        self._source_path_maps: dict[str, dict[str, str]] = {}
 
         self._truncated: set[tuple[str, str]] = set()
         self._truncated_elapsed: dict[tuple[str, str], int] = {}
@@ -152,14 +161,12 @@ class BoundaryLedger:
         self.source_cutoff_at_ns: int | None = None
         self._causal_lanes_enabled = bundle is None or (
             any(
-                isinstance(record.get("causal_lane"), str)
-                and bool(record["causal_lane"])
+                isinstance(record.get("causal_lane"), str) and bool(record["causal_lane"])
                 for kind in ("dispatch", "tool")
                 for record in (bundle.records(kind) if bundle is not None else [])
             )
             or any(
-                isinstance(record.get("causal_lane"), str)
-                and bool(record["causal_lane"])
+                isinstance(record.get("causal_lane"), str) and bool(record["causal_lane"])
                 for record in (
                     bundle.cutoff_tails.get("operations", []) if bundle is not None else []
                 )
@@ -176,16 +183,17 @@ class BoundaryLedger:
         # Load them first even though bundle.records() is otherwise kind-agnostic.
         for kind in ("dispatch", "tool", "grader", "artifact"):
             for record in bundle.records(kind):
+                if kind in {"dispatch", "tool"}:
+                    self._remember_source_paths(record)
                 lane = self._record_lane(kind, record)
                 if kind == "dispatch":
                     self._lane_of_record[str(record["dispatch_id"])] = lane
                 key = (kind, str(record["actor_id"]), lane)
                 self._expected.setdefault(key, []).append(record)
 
-        # A tail is source-only evidence, not claimable native work.  It still has
-        # to be recognized at entry: one concurrent branch may have remained open
-        # at cutoff while sibling lanes produced later closed records.  Matching it
-        # here lets the HTTP handler hold only that branch before native execution.
+        # A simple tail blocks before native entry. A composite task tail is
+        # claimable: replay enters it so already-closed child LLM/tools can run,
+        # then withholds the parent result the source never produced.
         for record in bundle.cutoff_tails.get("operations", []):
             kind = str(record.get("kind"))
             if kind not in _ID_FIELD:
@@ -195,11 +203,33 @@ class BoundaryLedger:
                 self._lane_of_record[str(record.get("record_id"))] = lane
             key = (kind, str(record["actor_id"]), lane)
             self._cutoff_expected.setdefault(key, []).append(record)
+            if record.get("replay_entry") == "enter-and-preserve-descendants":
+                identity = self._identity_of(kind, record)
+                self._truncated.add(identity)
+                self._truncated_elapsed[identity] = int(record["elapsed_ns"])
 
         for queue in self._expected.values():
             queue.sort(key=_issue_order)
         for queue in self._cutoff_expected.values():
             queue.sort(key=_issue_order)
+
+    def _remember_source_paths(self, record: dict[str, Any]) -> None:
+        actor = str(record["actor_id"])
+        mapping = self._source_path_maps.setdefault(actor, {})
+        workspace = record.get("native_workspace_path")
+        if isinstance(workspace, str) and workspace:
+            mapping[workspace] = "/native-workspace"
+        recovered = recorded_workspace_path_map(
+            self.adapter,
+            record.get("native_arguments", {}),
+            record.get("arguments", {}),
+        )
+        for physical, logical in recovered.items():
+            previous = mapping.setdefault(physical, logical)
+            require(
+                previous == logical,
+                f"actor {actor}: source path {physical!r} has conflicting logical bindings",
+            )
 
     def _record_lane(self, kind: str, record: dict[str, Any]) -> str | None:
         """Resolve the framework-independent causal lane for an operation."""
@@ -274,10 +304,6 @@ class BoundaryLedger:
         cutoff_queue = self._cutoff_expected.get(key, [])
         cutoff_cursor = self._cutoff_cursor.get(key, 0)
 
-        observed = None
-        if not self.fast_claim:
-            observed = claim_identity(kind, self._claimable(kind, payload))
-
         if cursor < len(queue):
             # Closed fixed work always has priority over diagnostic cutoff
             # evidence in the same causal lane. The first closed operation and
@@ -286,7 +312,10 @@ class BoundaryLedger:
             # tail first would stop at the earlier closed occurrence.
             expected = queue[cursor]
             if not self.fast_claim:
-                assert observed is not None
+                observed = claim_identity(
+                    kind,
+                    self._claimable(kind, payload, expected=expected),
+                )
                 recorded = claim_identity(kind, expected)
                 if observed != recorded:
                     raise MismatchError(
@@ -303,13 +332,33 @@ class BoundaryLedger:
         if cutoff_cursor < len(cutoff_queue):
             cutoff = cutoff_queue[cutoff_cursor]
             cutoff_matches = self.fast_claim
-            if observed is not None:
+            observed = None
+            if cutoff.get("pre_dispatch") is True:
+                expected_call = self._model_call_id(cutoff)
+                observed_call = self._model_call_id(payload)
+                cutoff_matches = (
+                    expected_call is not None and observed_call == expected_call
+                )
+            elif not self.fast_claim:
+                observed = claim_identity(
+                    kind,
+                    self._claimable(kind, payload, expected=cutoff),
+                )
                 cutoff_matches = observed == claim_identity(kind, cutoff)
             if cutoff_matches:
                 self._cutoff_cursor[key] = cutoff_cursor + 1
                 self._cutoff_intercepted.add(self._identity_of(kind, cutoff))
+                if cutoff.get("replay_entry") == "enter-and-preserve-descendants":
+                    return cutoff
                 raise WorkloadComplete(
                     f"native {kind} for actor {actor_id} entered a source cutoff tail"
+                )
+            if cutoff.get("pre_dispatch") is True:
+                raise MismatchError(
+                    f"native {kind} pre-dispatch cutoff drift for actor {actor_id} "
+                    f"lane {lane!r}: expected model call "
+                    f"{self._model_call_id(cutoff)!r} actual="
+                    f"{self._model_call_id(payload)!r}"
                 )
             assert observed is not None
             raise MismatchError(
@@ -338,16 +387,80 @@ class BoundaryLedger:
             f"the recording holds {len(queue)} and all are consumed"
         )
 
-    def _claimable(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _model_call_id(value: dict[str, Any]) -> str | None:
+        """Stable provider call identity for a pre-dispatch cutoff marker."""
+
+        native_call_id = value.get("native_call_id")
+        if isinstance(native_call_id, str) and native_call_id:
+            return native_call_id
+        origin = value.get("origin")
+        if isinstance(origin, dict):
+            model_call_id = origin.get("model_call_id")
+            if isinstance(model_call_id, str) and model_call_id:
+                return model_call_id
+        causal_lane = value.get("causal_lane")
+        if isinstance(causal_lane, str) and causal_lane.startswith("model-call:"):
+            return causal_lane.removeprefix("model-call:")
+        return None
+
+    def _claimable(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        expected: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         value = dict(payload)
         if kind in {"dispatch", "tool"}:
-            value["arguments_sha256"] = sha256_json(self._logical(payload.get("arguments", {})))
+            source_path_map = (
+                recorded_path_map(
+                    self.adapter,
+                    expected.get("native_arguments", {}),
+                    expected.get("arguments", {}),
+                )
+                if expected is not None
+                else {}
+            )
+            arguments = self._logical(
+                payload.get("arguments", {}),
+                workspace_path=self._workspace_path(payload),
+                source_path_map=source_path_map,
+            )
+            if self.adapter == "coral":
+                arguments = restore_embedded_coral_source_paths(
+                    arguments,
+                    self._source_path_maps.get(str(payload.get("actor_id")), {}),
+                    self.run_root,
+                    self._workspace_path(payload),
+                )
+            value["arguments_sha256"] = sha256_json(arguments)
         return value
 
-    def _logical(self, arguments: Any) -> Any:
+    @staticmethod
+    def _workspace_path(payload: dict[str, Any]) -> Path | None:
+        value = payload.get("workspace_path")
+        if not isinstance(value, str) or not value:
+            return None
+        path = Path(value)
+        require(path.is_absolute(), "native workspace_path must be absolute")
+        return path
+
+    def _logical(
+        self,
+        arguments: Any,
+        *,
+        workspace_path: Path | None = None,
+        source_path_map: dict[str, str] | None = None,
+    ) -> Any:
         """Reduce this run's directories to run-independent names."""
 
-        return bind_typed_fields(self.adapter, arguments, self.path_map)
+        path_map = dict(self.path_map)
+        if workspace_path is not None:
+            path_map[str(workspace_path.resolve())] = "/native-workspace"
+        if source_path_map is not None:
+            path_map.update(source_path_map)
+        return bind_typed_fields(self.adapter, arguments, path_map)
 
     # ---- start ---------------------------------------------------------------
 
@@ -409,9 +522,21 @@ class BoundaryLedger:
             # The recorded arguments carry logical directory names. Expand them into
             # this run's directories so the native call is made with the identity the
             # recording proved, but against the workspace that actually exists now.
-            response["execution_arguments"] = to_physical(
-                self.adapter, expected["arguments"], self.run_root, self.repo
+            execution_arguments = to_physical(
+                self.adapter,
+                expected["arguments"],
+                self.run_root,
+                self.repo,
+                self._workspace_path(payload),
             )
+            if self.adapter == "coral":
+                execution_arguments = rebind_embedded_coral_paths(
+                    execution_arguments,
+                    self._source_path_maps.get(actor_id, {}),
+                    self.run_root,
+                    self._workspace_path(payload),
+                )
+            response["execution_arguments"] = execution_arguments
         return response
 
     def _resolve_trigger(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -431,9 +556,7 @@ class BoundaryLedger:
 
     # ---- complete ------------------------------------------------------------
 
-    def complete(
-        self, payload: dict[str, Any], *, defer_delivery: bool = False
-    ) -> dict[str, Any]:
+    def complete(self, payload: dict[str, Any], *, defer_delivery: bool = False) -> dict[str, Any]:
         reservation_id = payload.get("reservation_id")
         require(isinstance(reservation_id, str), "completion reservation_id is required")
         reservation = self.active.pop(reservation_id, None)
@@ -524,7 +647,10 @@ class BoundaryLedger:
     ) -> dict[str, Any]:
         request = reservation.request
         native_arguments = request.get("arguments", {})
-        arguments = self._logical(native_arguments)
+        arguments = self._logical(
+            native_arguments,
+            workspace_path=self._workspace_path(request),
+        )
         return {
             **common,
             "causal_lane": reservation.lane,
@@ -536,6 +662,9 @@ class BoundaryLedger:
             "arguments": arguments,
             "arguments_sha256": sha256_json(arguments),
             "native_arguments": native_arguments,
+            "native_workspace_path": (
+                str(workspace) if (workspace := self._workspace_path(request)) is not None else None
+            ),
             "origin": request.get("origin"),
             "status": payload.get("status"),
             "execution_call_id": payload.get("execution_call_id"),
@@ -549,7 +678,10 @@ class BoundaryLedger:
     ) -> dict[str, Any]:
         request = reservation.request
         native_arguments = request.get("arguments", {})
-        arguments = self._logical(native_arguments)
+        arguments = self._logical(
+            native_arguments,
+            workspace_path=self._workspace_path(request),
+        )
         contract = request["result_contract"]
         native_result = payload.get("result")
         projection = project_result(native_result, contract)
@@ -572,6 +704,9 @@ class BoundaryLedger:
             "arguments": arguments,
             "arguments_sha256": sha256_json(arguments),
             "native_arguments": native_arguments,
+            "native_workspace_path": (
+                str(workspace) if (workspace := self._workspace_path(request)) is not None else None
+            ),
             "result_contract": contract,
             "semantic_timeout_s": request.get("semantic_timeout_s"),
             "result": framework_result,
@@ -689,7 +824,10 @@ class BoundaryLedger:
             self._truncated.add(identity)
             elapsed = max(0, cutoff_at_ns - reservation.started_at_ns)
             self._truncated_elapsed[identity] = elapsed
-            arguments = self._logical(reservation.request.get("arguments", {}))
+            arguments = self._logical(
+                reservation.request.get("arguments", {}),
+                workspace_path=self._workspace_path(reservation.request),
+            )
             tails.append(
                 {
                     "cutoff_truncated": True,
@@ -702,6 +840,7 @@ class BoundaryLedger:
                     "causal_lane": reservation.lane,
                     "session_id": reservation.request.get("session_id"),
                     "origin": reservation.request.get("origin"),
+                    "parent_span_id": reservation.request.get("parent_span_id"),
                     **(
                         {"dispatch_id": reservation.request.get("dispatch_id")}
                         if reservation.kind == "tool"
@@ -714,10 +853,22 @@ class BoundaryLedger:
                     "operation": reservation.request.get("operation"),
                     "version": reservation.request.get("version"),
                     "arguments": arguments,
+                    "native_arguments": reservation.request.get("arguments", {}),
+                    "native_workspace_path": (
+                        str(workspace)
+                        if (workspace := self._workspace_path(reservation.request)) is not None
+                        else None
+                    ),
                     "arguments_sha256": sha256_json(arguments),
                     "result_contract": reservation.request.get("result_contract"),
                     "source_started_at_ns": reservation.started_at_ns,
                     "elapsed_ns": elapsed,
+                    "replay_entry": (
+                        "enter-and-preserve-descendants"
+                        if reservation.request.get("name") == "task"
+                        and reservation.kind in {"dispatch", "tool"}
+                        else "block-before-entry"
+                    ),
                 }
             )
         return tails
@@ -818,8 +969,7 @@ class BoundaryLedger:
         return {
             "missing": sorted(missing),
             "evidence_not_delivered": sorted(
-                f"{kind}:{record_id}"
-                for kind, record_id in self._completed - self._delivered
+                f"{kind}:{record_id}" for kind, record_id in self._completed - self._delivered
             ),
             "unexpected_active": sorted(
                 f"{r.kind}:{r.record_id}"

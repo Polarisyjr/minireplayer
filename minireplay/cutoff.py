@@ -5,7 +5,10 @@ inside the window while the dispatch that owns it finishes outside; keeping the 
 alone would leave the bundle referencing a record it does not contain.
 
 So this prunes to a fixed point: a record survives only if everything it depends on
-also survives. What remains is the largest causally closed prefix of the run.
+also survives. Composite cutoff operations are the exception. A built-in ``task``
+may still be running when its already-completed child LLM and tool operations close.
+Those descendants remain fixed work, with the open parent represented by its cutoff
+tail rather than a closed ledger record.
 """
 
 from __future__ import annotations
@@ -41,25 +44,34 @@ def _rewrite(stage: Path, relative: str, records: list[dict[str, Any]]) -> None:
     atomic_write(stage / relative, payload)
 
 
-def close_stage_at_cutoff(stage_dir: Path) -> dict[str, Any]:
+def close_stage_at_cutoff(
+    stage_dir: Path,
+    *,
+    cutoff_tails: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     stage_dir = stage_dir.resolve()
     kept = {kind: _load(stage_dir, relative) for kind, relative in _LEDGERS.items()}
     spans = _load(stage_dir, "spans.jsonl")
+    open_parent_span_ids = {
+        str(record["span_id"])
+        for record in (cutoff_tails or {}).get("operations", [])
+        if record.get("replay_entry") == "enter-and-preserve-descendants"
+        and isinstance(record.get("span_id"), str)
+        and record["span_id"]
+    }
     before = {kind: len(records) for kind, records in kept.items()}
     before["span"] = len(spans)
 
     while True:
         ids = {
-            kind: {str(record[_ID[kind]]) for record in records}
-            for kind, records in kept.items()
+            kind: {str(record[_ID[kind]]) for record in records} for kind, records in kept.items()
         }
         changed = False
 
         surviving = [
             tool
             for tool in kept["tool"]
-            if tool.get("dispatch_id") is None
-            or str(tool.get("dispatch_id")) in ids["dispatch"]
+            if tool.get("dispatch_id") is None or str(tool.get("dispatch_id")) in ids["dispatch"]
         ]
         if len(surviving) != len(kept["tool"]):
             kept["tool"] = surviving
@@ -95,12 +107,12 @@ def close_stage_at_cutoff(stage_dir: Path) -> dict[str, Any]:
             kept["grader"] = surviving
             changed = True
 
-        # A completed child is not a replayable prefix when its parent operation
-        # was still open at cutoff.  Parent links live on spans because they cross
-        # LLM, tool and dispatch kinds; pruning them here closes the graph without
-        # adapter- or role-specific rules.  Records whose instrumentation emitted
-        # no span remain eligible for the legacy dependency checks above.
-        span_ids = {str(span["span_id"]) for span in spans}
+        # Parent links live on spans because they cross LLM, tool and dispatch
+        # kinds. Ordinary missing parents invalidate the descendant branch. A
+        # composite cutoff parent remains a valid owner even though it has no
+        # closed ledger record: replay enters that task and replays its closed
+        # descendants before withholding the unfinished parent result.
+        span_ids = {str(span["span_id"]) for span in spans} | open_parent_span_ids
         orphan_spans = {
             str(span["span_id"])
             for span in spans
@@ -110,9 +122,7 @@ def close_stage_at_cutoff(stage_dir: Path) -> dict[str, Any]:
         if orphan_spans:
             for kind, records in kept.items():
                 surviving = [
-                    record
-                    for record in records
-                    if str(record.get("span_id")) not in orphan_spans
+                    record for record in records if str(record.get("span_id")) not in orphan_spans
                 ]
                 if len(surviving) != len(records):
                     kept[kind] = surviving
@@ -143,6 +153,7 @@ def close_stage_at_cutoff(stage_dir: Path) -> dict[str, Any]:
         "before": before,
         "after": after,
         "discarded": {kind: before[kind] - after[kind] for kind in before},
+        "open_parent_span_ids": sorted(open_parent_span_ids),
     }
     atomic_write_json(stage_dir / "cutoff-report.json", report)
     return report

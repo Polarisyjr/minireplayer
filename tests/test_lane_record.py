@@ -155,6 +155,91 @@ def test_different_actors_write_different_lane_files(tmp_path: Path) -> None:
     assert len(list(tmp_path.glob("lane-*.jsonl"))) == 2
 
 
+def test_adapter_record_id_hint_survives_lane_materialization(tmp_path: Path) -> None:
+    events = tmp_path / "lane-events"
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    actor = "actor-0"
+    producer_id = "artifact-stable-v1"
+
+    producer = local_start(
+        root=events,
+        payload={
+            "kind": "artifact",
+            "actor_id": actor,
+            "session_id": actor,
+            "process_role": "artifact-producer",
+            "parent_span_id": None,
+            "started_at_ns": 100,
+            "logical_path": "/native-run/attempt.json",
+            "operation": "create",
+            "version": 1,
+            "record_id_hint": producer_id,
+        },
+    )
+    assert producer["record_id"] == producer_id
+    _complete(
+        events,
+        producer,
+        kind="artifact",
+        actor_id=actor,
+        ended_at_ns=110,
+        status="ok",
+        physical_path="/tmp/attempt.json",
+        process_role="artifact-producer",
+        bytes_sha256="0" * 64,
+        size=1,
+        mode=0o644,
+        triggered_by=[],
+        read_from=None,
+        native_execution=True,
+    )
+    reader = local_start(
+        root=events,
+        payload={
+            "kind": "artifact",
+            "actor_id": actor,
+            "session_id": actor,
+            "process_role": "artifact-consumer",
+            "parent_span_id": None,
+            "started_at_ns": 120,
+            "logical_path": "/native-run/attempt.json",
+            "operation": "read",
+            "version": 1,
+        },
+    )
+    _complete(
+        events,
+        reader,
+        kind="artifact",
+        actor_id=actor,
+        ended_at_ns=130,
+        status="ok",
+        physical_path="/tmp/attempt.json",
+        process_role="artifact-consumer",
+        bytes_sha256="0" * 64,
+        size=1,
+        mode=0o644,
+        triggered_by=[],
+        read_from=producer_id,
+        native_execution=True,
+    )
+
+    materialize_lane_recording(
+        event_dir=events,
+        stage_dir=stage,
+        cutoff_at_ns=200,
+        auth_token="unused",
+        adapter="coral",
+        run_root=tmp_path,
+        repo=tmp_path,
+    )
+
+    artifacts = list(iter_jsonl(stage / "artifacts.jsonl"))
+    assert [artifact["event_id"] for artifact in artifacts] == [producer_id, reader["record_id"]]
+    assert artifacts[1]["read_from"] == producer_id
+
+
 def test_composite_scope_is_diagnostic_only(tmp_path: Path) -> None:
     events = tmp_path / "lane-events"
     stage = tmp_path / "stage"

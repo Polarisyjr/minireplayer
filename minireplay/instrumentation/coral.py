@@ -5,8 +5,11 @@ import hashlib
 import inspect
 import json
 import os
+import subprocess
 from pathlib import Path
 
+from minireplay.coral_control import grader_recorded
+from minireplay.replay_control import session_prefix_consumed
 from minireplay.sdk import (
     BoundaryClient,
     current_context,
@@ -18,17 +21,18 @@ from minireplay.sdk import (
 from minireplay.serialization import jsonable
 from minireplay.util import sha256_json
 
-from .gate import resolve_actor
+from .gate import bind_task_lane, ready_and_wait, resolve_actor
 from .patching import method_identity, patch_method
 from .state import state
 
 _SPAWN_ENV: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
     "minireplay_coral_spawn_env", default=None
 )
+_INVOCATION_COUNTS: dict[str, int] = {}
 
 
 def _plugin_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "assets/opencode_minireplay_plugin.js"
+    return Path(__file__).resolve().parents[1] / "assets/opencode_native_replay_plugin.js"
 
 
 def _target_for(actor: str) -> str:
@@ -51,12 +55,63 @@ def _task_source_id() -> str:
     return value
 
 
+def _team_integer(name: str) -> int:
+    value = os.environ.get(name)
+    try:
+        parsed = int(value) if value is not None else -1
+    except ValueError as exc:
+        raise RuntimeError(f"CORAL team has invalid {name}: {value!r}") from exc
+    if parsed < 0:
+        raise RuntimeError(f"CORAL team has no {name}")
+    return parsed
+
+
+def _team_lane_metadata() -> dict[str, object]:
+    team_size = _team_integer("NATIVE_REPLAY_CORAL_TEAM_SIZE")
+    if team_size != 4:
+        raise RuntimeError("CORAL replay requires exactly four agents per team")
+    return {
+        "framework": "coral",
+        "lane_kind": "team",
+        "concurrency_unit": "coral-team",
+        "team_slot": _team_integer("NATIVE_REPLAY_CORAL_TEAM_SLOT"),
+        "slot_generation": _team_integer("NATIVE_REPLAY_CORAL_SLOT_GENERATION"),
+        "run_index": _team_integer("NATIVE_REPLAY_CORAL_RUN_INDEX"),
+        "team_size": team_size,
+        "source_task_id": os.environ.get("NATIVE_REPLAY_CORAL_SOURCE_TASK_ID", _task_source_id()),
+    }
+
+
 def _agent_source_id(agent_id: str) -> str:
     return f"{_task_source_id()}--{agent_id}"
 
 
 def _agent_actor(agent_id: str) -> str:
-    return resolve_actor(_agent_source_id(agent_id))
+    if not agent_id.startswith("agent-"):
+        raise RuntimeError(f"invalid CORAL agent identity: {agent_id!r}")
+    try:
+        agent_index = int(agent_id.removeprefix("agent-"))
+    except ValueError as exc:
+        raise RuntimeError(f"invalid CORAL agent identity: {agent_id!r}") from exc
+    team = _team_lane_metadata()
+    if not 1 <= agent_index <= int(team["team_size"]):
+        raise RuntimeError(f"CORAL agent is outside its four-agent team: {agent_id!r}")
+    return bind_task_lane(
+        _agent_source_id(agent_id),
+        actor_metadata={
+            **team,
+            "lane_kind": "agent",
+            "agent_id": agent_id,
+            "agent_index": agent_index,
+            "parent_actor_id": resolve_actor(_task_source_id()),
+        },
+    )
+
+
+def _agent_target(agent_id: str) -> str:
+    # Resolve role routing from the framework-native ID before ``resolve_actor``
+    # hashes the task/agent composite into a filesystem-safe ledger actor.
+    return _target_for(_agent_source_id(agent_id))
 
 
 def _inject_plugin(worktree: Path, model: str) -> None:
@@ -103,7 +158,7 @@ def _inject_plugin(worktree: Path, model: str) -> None:
     options = provider.setdefault("options", {})
     if not isinstance(options, dict):
         raise RuntimeError(f"CORAL OpenCode provider options are invalid: {provider_name}")
-    options["baseURL"] = f"{os.environ['NATIVE_REPLAY_PROXY_URL'].rstrip('/')}/v1"
+    options["baseURL"] = os.environ["NATIVE_REPLAY_PROXY_URL"].rstrip("/")
     temporary = config_path.with_suffix(f".json.tmp.{os.getpid()}")
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
     os.replace(temporary, config_path)
@@ -114,15 +169,21 @@ def _runtime_start_factory(original):
         worktree = Path(worktree_path)
         source_actor = (worktree / ".coral_agent_id").read_text().strip()
         actor = _agent_actor(source_actor)
+        invocation_key = _agent_source_id(source_actor)
+        invocation_index = _INVOCATION_COUNTS.get(invocation_key, 0)
+        _INVOCATION_COUNTS[invocation_key] = invocation_index + 1
+        invocation_id = f"{actor}/invocation-{invocation_index}"
         bound = inspect.signature(original).bind(self, worktree_path, *args, **kwargs)
         bound.apply_defaults()
         _inject_plugin(worktree, str(bound.arguments["model"]))
-        bound.arguments["gateway_url"] = f"{os.environ['NATIVE_REPLAY_PROXY_URL'].rstrip('/')}/v1"
+        bound.arguments["gateway_url"] = os.environ["NATIVE_REPLAY_PROXY_URL"].rstrip("/")
         spawn_env = {
             "NATIVE_REPLAY_ACTOR_ID": actor,
             "NATIVE_REPLAY_SESSION_ID": actor,
+            "NATIVE_REPLAY_INVOCATION_ID": invocation_id,
+            "NATIVE_REPLAY_INVOCATION_INDEX": str(invocation_index),
             "NATIVE_REPLAY_PROCESS_ROLE": "coral-opencode",
-            "NATIVE_REPLAY_TARGET_ID": _target_for(actor),
+            "NATIVE_REPLAY_TARGET_ID": _agent_target(source_actor),
             "OPENCODE_DISABLE_AUTOUPDATE": "true",
             "OPENCODE_DISABLE_MODELS_FETCH": "true",
         }
@@ -151,6 +212,8 @@ def _grade_factory(original):
 
     def wrapped(attempt, config_path, coral_dir, config):
         actor = _agent_actor(str(attempt.agent_id))
+        logical_attempt_path = _attempt_logical_path(coral_dir, attempt, actor)
+        input_artifact_id = _artifact_id(logical_attempt_path, _attempt_version(attempt))
         tokens = set_context(
             actor_id=actor,
             process_role="coral-grader",
@@ -165,6 +228,10 @@ def _grade_factory(original):
                 trigger_id=str(attempt.commit_hash),
                 invoke=lambda: original(attempt, config_path, coral_dir, config),
                 result_encoder=jsonable,
+                # The daemon reads the pending attempt before entering _grade_one.
+                # Declare that input explicitly; the completed v2 write is captured
+                # by write_attempt while the grader is active.
+                artifact_versions=lambda: [input_artifact_id],
                 timeout_s=float(config.grader.timeout),
             )
         finally:
@@ -176,6 +243,36 @@ def _grade_factory(original):
 def _artifact_id(logical_path: str, version: int) -> str:
     digest = hashlib.sha256(logical_path.encode()).hexdigest()[:24]
     return f"artifact-{digest}-v{version}"
+
+
+def _attempt_logical_path(coral_dir, attempt, actor: str) -> str:
+    # CORAL stores attempts below a run-name-specific results directory. That
+    # physical directory changes between record and replay. A git commit hash is
+    # also unstable because its timestamp changes. The ancestry generation and
+    # tree hash stay fixed while still rejecting a different evaluated snapshot.
+    root = Path(coral_dir).resolve().parent
+    candidates = (root / "repo", root)
+    repo = next((value for value in candidates if (value / ".git").exists()), None)
+    if repo is None:
+        raise RuntimeError(f"cannot locate CORAL attempt repo from {coral_dir}")
+
+    def git(*arguments: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            raise RuntimeError(
+                f"cannot resolve CORAL attempt identity for {attempt.commit_hash}: "
+                f"{result.stderr.strip()}"
+            )
+        return result.stdout.strip()
+
+    tree = git("rev-parse", f"{attempt.commit_hash}^{{tree}}")
+    generation = git("rev-list", "--count", str(attempt.commit_hash))
+    return f"/coral-attempts/{actor}/g{generation}-{tree}.json"
 
 
 def _attempt_path(coral_dir, attempt) -> Path:
@@ -195,7 +292,8 @@ def _attempt_payload(attempt) -> bytes:
 def _write_attempt_factory(original):
     def wrapped(coral_dir, attempt):
         context_tokens = None
-        if current_context()["actor_id"] == "unknown":
+        actor = str(current_context()["actor_id"])
+        if actor == "unknown":
             actor = _agent_actor(str(attempt.agent_id))
             context_tokens = set_context(
                 actor_id=actor,
@@ -204,7 +302,7 @@ def _write_attempt_factory(original):
                 llm_role="coral-grader",
             )
         path = _attempt_path(coral_dir, attempt)
-        logical = str(jsonable(path))
+        logical = _attempt_logical_path(coral_dir, attempt, actor)
         version = _attempt_version(attempt)
         boundary = BoundaryClient()
         reservation = boundary.start(
@@ -244,57 +342,10 @@ def _write_attempt_factory(original):
     return wrapped
 
 
-def _read_attempt_factory(original):
-    def wrapped(coral_dir, commit_hash):
-        result = original(coral_dir, commit_hash)
-        if result is None:
-            return None
-        context_tokens = None
-        if current_context()["actor_id"] == "unknown":
-            actor = _agent_actor(str(result.agent_id))
-            context_tokens = set_context(
-                actor_id=actor,
-                process_role="coral-artifact-consumer",
-                session_id=f"{actor}/attempt/{result.commit_hash}",
-                llm_role="coral-grader",
-            )
-        path = _attempt_path(coral_dir, result)
-        logical = str(jsonable(path))
-        version = _attempt_version(result)
-        boundary = BoundaryClient()
-        reservation = boundary.start(
-            "artifact",
-            logical_path=logical,
-            operation="read",
-            version=version,
-        )
-        try:
-            payload = _attempt_payload(result)
-            boundary.complete(
-                reservation["reservation_id"],
-                status="ok",
-                physical_path=str(jsonable(path)),
-                process_role=str(current_context()["process_role"]),
-                bytes_sha256=hashlib.sha256(payload).hexdigest(),
-                size=len(payload),
-                mode=path.stat().st_mode & 0o7777,
-                triggered_by=[],
-                read_from=_artifact_id(logical, version),
-                native_execution=True,
-            )
-            return result
-        finally:
-            if context_tokens is not None:
-                reset_context(context_tokens)
-
-    return wrapped
-
-
 def _install_attempt_artifacts() -> None:
     import coral.hub.attempts as attempts
 
     patch_method(attempts, "write_attempt", _write_attempt_factory)
-    patch_method(attempts, "read_attempt", _read_attempt_factory)
     state().mark("coral-shared-artifacts")
 
 
@@ -302,14 +353,19 @@ def _start_all_factory(original):
     def wrapped(self, *args, **kwargs):
         source = _task_source_id()
         actor = resolve_actor(source)
-        tokens = set_context(
-            actor_id=actor,
+        tokens = ready_and_wait(
+            source,
             process_role="coral-team",
             session_id=source,
             llm_role="coral-team",
             target_id=_target_for(actor),
+            actor_metadata=_team_lane_metadata(),
         )
         self._minireplay_task_tokens = tokens
+        # Full replay can reach its first eval while start_all is still launching
+        # sibling agents. Preserve the pre-launch snapshot so monitor_loop does not
+        # mistake those early attempt files for work that predates this run.
+        self._minireplay_monitor_seen_override = set()
         try:
             return original(self, *args, **kwargs)
         except Exception as exc:
@@ -325,11 +381,125 @@ def _start_all_factory(original):
     return wrapped
 
 
+def _get_seen_attempts_factory(original):
+    def wrapped(self):
+        override = getattr(self, "_minireplay_monitor_seen_override", None)
+        if override is not None:
+            del self._minireplay_monitor_seen_override
+            return set(override)
+        return original(self)
+
+    return wrapped
+
+
+def _current_invocation(agent_id: str) -> tuple[str, str] | None:
+    actor = _agent_actor(agent_id)
+    invocation_key = _agent_source_id(agent_id)
+    invocation_index = _INVOCATION_COUNTS.get(invocation_key, 0) - 1
+    if invocation_index < 0:
+        return None
+    return actor, f"{actor}/invocation-{invocation_index}/root-0"
+
+
+def _recorded_control(actor: str, invocation_index: int) -> dict[str, object] | None:
+    controls = json.loads(os.environ.get("NATIVE_REPLAY_CORAL_CONTROLS", "[]"))
+    for control in controls:
+        if (
+            isinstance(control, dict)
+            and control.get("actor_id") == actor
+            and control.get("invocation_index") == invocation_index
+        ):
+            return control
+    return None
+
+
+def _schedule_interrupt_and_resume_factory(original):
+    def wrapped(self, idx, prompt, prompt_source=None):
+        live_replay_heartbeat = (
+            os.environ.get("NATIVE_REPLAY_MODE") == "replay"
+            and isinstance(prompt_source, str)
+            and prompt_source.startswith("heartbeat:")
+        )
+        if live_replay_heartbeat:
+            # Replay consumes recorded controls below. Live grader completion
+            # order must never invent, suppress, or reorder an invocation.
+            return False
+        return original(self, idx, prompt, prompt_source=prompt_source)
+
+    return wrapped
+
+
+def _request_interrupt_factory(original):
+    def wrapped(self, *, at_turn_boundary=False):
+        recorded_restart = (
+            at_turn_boundary
+            and os.environ.get("NATIVE_REPLAY_MODE") == "replay"
+            and bool(getattr(self, "_minireplay_recorded_restart", False))
+        )
+        if not recorded_restart:
+            return original(self, at_turn_boundary=at_turn_boundary)
+        return original(self, at_turn_boundary=False)
+
+    return wrapped
+
+
+def _advance_pending_resumes_factory(original):
+    def wrapped(self):
+        if os.environ.get("NATIVE_REPLAY_MODE") == "replay":
+            run_root = Path(os.environ["NATIVE_REPLAY_RUN_ROOT"])
+            pending = getattr(self, "_pending_resumes", {})
+            for idx, handle in enumerate(self.handles):
+                if handle.agent_id in pending:
+                    continue
+                current = _current_invocation(str(handle.agent_id))
+                if current is None:
+                    continue
+                actor, root_session = current
+                current_index = int(
+                    root_session.split("/invocation-", 1)[1].split("/", 1)[0]
+                )
+                control = _recorded_control(actor, current_index + 1)
+                if control is None:
+                    continue
+                trigger = control.get("trigger_grader_attempt_id")
+                if not session_prefix_consumed(run_root, actor, root_session):
+                    continue
+                if not grader_recorded(
+                    run_root,
+                    str(trigger) if isinstance(trigger, str) else None,
+                ):
+                    continue
+
+                handle._minireplay_recorded_restart = True
+                try:
+                    scheduled = self._schedule_interrupt_and_resume(
+                        idx,
+                        str(control["prompt"]),
+                        prompt_source=f"minireplay-recorded:{control['source']}",
+                    )
+                finally:
+                    if hasattr(handle, "_minireplay_recorded_restart"):
+                        del handle._minireplay_recorded_restart
+                if not scheduled:
+                    raise RuntimeError(
+                        f"recorded CORAL restart was rejected for {actor} "
+                        f"invocation {current_index + 1}"
+                    )
+        return original(self)
+
+    return wrapped
+
+
 def _team_terminal(self) -> dict[str, object]:
     return {
         "task_id": _task_source_id(),
         "one_shot_terminal": bool(self._one_shot_terminal),
         "one_shot_failure": self._one_shot_failure,
+        "termination_reason": getattr(self, "_termination_reason", None),
+        # CORAL's manager clock is wall/epoch time, despite the historical
+        # ``_at_ns`` field name. Keep the unit explicit at the recording boundary.
+        "replay_cutoff_at_epoch_ns": getattr(self, "_replay_cutoff_at_ns", None),
+        "run_dir": str(self.paths.run_dir) if getattr(self, "paths", None) is not None else None,
         "max_total_turns": int(self.config.agents.max_total_turns),
         "turn_count": int(self._turn_count()),
         "restart_counts": {
@@ -364,13 +534,19 @@ def _monitor_factory(original):
                     result={"error_type": type(exc).__name__, "message": str(exc)},
                 )
                 raise
-            terminal = _team_terminal(self)
-            success = bool(self._one_shot_terminal and self._one_shot_failure is None)
-            report_task_terminal(
-                actor_id=resolve_actor(_task_source_id()),
-                status="success" if success else "failure",
-                result=terminal,
-            )
+            # Replay stops the native driver as soon as every fixed slot is
+            # delivered. That can interrupt the manager before its next polling
+            # tick sets ``_one_shot_terminal``; absence of a native terminal is
+            # then expected, not a task failure. Only publish a terminal the
+            # manager itself reached, or a real one-shot failure it diagnosed.
+            if self._one_shot_terminal or self._one_shot_failure is not None:
+                terminal = _team_terminal(self)
+                success = bool(self._one_shot_terminal and self._one_shot_failure is None)
+                report_task_terminal(
+                    actor_id=resolve_actor(_task_source_id()),
+                    status="success" if success else "failure",
+                    result=terminal,
+                )
             return result
         finally:
             reset_context(tokens)
@@ -387,12 +563,25 @@ def install() -> None:
 
     import coral.agent.builtin.opencode as opencode
     import coral.agent.manager as manager
+    import coral.agent.runtime as runtime
     import coral.grader.daemon as daemon
 
     patch_method(opencode.OpenCodeRuntime, "start", _runtime_start_factory)
     patch_method(opencode, "_clean_env", _clean_env_factory)
     patch_method(manager.AgentManager, "start_all", _start_all_factory)
+    patch_method(manager.AgentManager, "_get_seen_attempts", _get_seen_attempts_factory)
+    patch_method(
+        manager.AgentManager,
+        "_schedule_interrupt_and_resume",
+        _schedule_interrupt_and_resume_factory,
+    )
+    patch_method(
+        manager.AgentManager,
+        "_advance_pending_resumes",
+        _advance_pending_resumes_factory,
+    )
     patch_method(manager.AgentManager, "monitor_loop", _monitor_factory)
+    patch_method(runtime.AgentHandle, "request_interrupt", _request_interrupt_factory)
     patch_method(daemon, "_grade_one", _grade_factory)
     patch_method(daemon, "write_attempt", _write_attempt_factory)
     state().mark("coral-opencode-plugin")

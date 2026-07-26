@@ -13,6 +13,7 @@ comparison cost.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -101,6 +102,50 @@ class Bundle:
                 mapping[source] = actor_id
         return mapping
 
+    def cutoff_source_actor_ids(self) -> set[str]:
+        """Framework task identities still live at the source cutoff.
+
+        A refill scheduler can run several source tasks in one logical lane. A
+        terminal for the lane's first task therefore does not prove that its
+        refill task also completed before the recording window closed.
+        """
+
+        recorded_sources = set(self.actor_map())
+        terminal_sources: set[str] = set()
+        for terminal in self.terminal.get("task_terminals", []):
+            if not isinstance(terminal, dict):
+                continue
+            task = terminal.get("task")
+            source = task.get("source_actor_id") if isinstance(task, dict) else None
+            if isinstance(source, str) and source:
+                terminal_sources.add(source)
+                continue
+            # Older/synthetic bundles may only carry actor_id. Treat it as a
+            # source identity only when the manifest maps that exact value.
+            actor_id = terminal.get("actor_id")
+            if isinstance(actor_id, str) and actor_id in recorded_sources:
+                terminal_sources.add(actor_id)
+        return recorded_sources - terminal_sources
+
+    def cutoff_actor_ids(self) -> set[str]:
+        """Logical lanes with at least one source task open at cutoff."""
+
+        mapping = self.actor_map()
+        cutoff = {
+            mapping[source]
+            for source in self.cutoff_source_actor_ids()
+            if source in mapping
+        }
+        terminal_actors = {
+            str(terminal["actor_id"])
+            for terminal in self.terminal.get("task_terminals", [])
+            if isinstance(terminal, dict) and isinstance(terminal.get("actor_id"), str)
+        }
+        # Preserve support for dynamic actors whose manifests predate explicit
+        # source_actor_ids.
+        cutoff.update(set(self.actor_ids()) - terminal_actors)
+        return cutoff
+
 
 def counts_of(
     *,
@@ -119,6 +164,140 @@ def counts_of(
     }
 
 
+def _concurrency_window(
+    *,
+    adapter: str,
+    workload: dict[str, Any],
+    actors: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if adapter != "coral":
+        return None
+    declared = [actor for actor in actors if isinstance(actor.get("lane"), dict)]
+    if not declared:
+        return None
+    require(
+        len(declared) == len(actors),
+        "CORAL actor inventory mixes hierarchical and flat lanes",
+    )
+    size = int(workload.get("concurrency", 0))
+    team_size = int(workload.get("coral_team_size", 0))
+    require(size > 0, "CORAL concurrency window has no team slots")
+    require(team_size == 4, "CORAL concurrency window must use four-agent teams")
+
+    attempts: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for actor in actors:
+        actor_id = str(actor["actor_id"])
+        lane = actor["lane"]
+        require(
+            lane.get("concurrency_unit") == "coral-team",
+            f"CORAL actor {actor_id!r} has the wrong concurrency unit",
+        )
+        slot = int(lane.get("team_slot", -1))
+        generation = int(lane.get("slot_generation", -1))
+        run_index = int(lane.get("run_index", -1))
+        require(
+            0 <= slot < size and generation >= 0 and run_index >= 0,
+            f"CORAL actor {actor_id!r} has an invalid team slot",
+        )
+        require(
+            int(lane.get("team_size", -1)) == team_size,
+            f"CORAL actor {actor_id!r} changed team size",
+        )
+        key = (slot, generation, run_index)
+        attempt = attempts.setdefault(
+            key,
+            {
+                "team_slot": slot,
+                "slot_generation": generation,
+                "run_index": run_index,
+                "source_task_id": lane.get("source_task_id"),
+                "team_actor_id": None,
+                "agent_actor_ids": {},
+                "agent_parent_ids": set(),
+            },
+        )
+        require(
+            attempt["source_task_id"] == lane.get("source_task_id"),
+            f"CORAL team slot {slot} generation {generation} mixes source tasks",
+        )
+        kind = lane.get("lane_kind")
+        if kind == "team":
+            require(
+                attempt["team_actor_id"] is None,
+                f"CORAL team slot {slot} generation {generation} has two parent lanes",
+            )
+            attempt["team_actor_id"] = actor_id
+            continue
+        require(kind == "agent", f"CORAL actor {actor_id!r} has an invalid lane kind")
+        agent_index = int(lane.get("agent_index", -1))
+        require(
+            1 <= agent_index <= team_size,
+            f"CORAL actor {actor_id!r} is outside its team",
+        )
+        require(
+            lane.get("parent_actor_id") is not None,
+            f"CORAL actor {actor_id!r} has no parent team lane",
+        )
+        attempt["agent_parent_ids"].add(str(lane["parent_actor_id"]))
+        members = attempt["agent_actor_ids"]
+        require(
+            agent_index not in members,
+            f"CORAL team slot {slot} generation {generation} duplicates agent-{agent_index}",
+        )
+        members[agent_index] = actor_id
+
+    slots: list[dict[str, Any]] = []
+    for slot in range(size):
+        slot_attempts = [
+            value
+            for (observed_slot, _generation, _run_index), value in attempts.items()
+            if observed_slot == slot
+        ]
+        slot_attempts.sort(key=lambda value: value["slot_generation"])
+        require(bool(slot_attempts), f"CORAL concurrency window never occupied team slot {slot}")
+        require(
+            [value["slot_generation"] for value in slot_attempts]
+            == list(range(len(slot_attempts))),
+            f"CORAL team slot {slot} has a non-contiguous refill history",
+        )
+        rendered: list[dict[str, Any]] = []
+        for attempt in slot_attempts:
+            require(
+                isinstance(attempt["team_actor_id"], str),
+                f"CORAL team slot {slot} generation {attempt['slot_generation']} has no parent",
+            )
+            members = attempt["agent_actor_ids"]
+            require(
+                attempt["agent_parent_ids"] == {attempt["team_actor_id"]},
+                f"CORAL team slot {slot} generation "
+                f"{attempt['slot_generation']} has detached agent lanes",
+            )
+            require(
+                sorted(members) == list(range(1, team_size + 1)),
+                f"CORAL team slot {slot} generation "
+                f"{attempt['slot_generation']} is not one complete four-agent group",
+            )
+            rendered.append(
+                {
+                    **{
+                        key: value
+                        for key, value in attempt.items()
+                        if key not in {"agent_actor_ids", "agent_parent_ids"}
+                    },
+                    "agent_actor_ids": [members[index] for index in range(1, team_size + 1)],
+                }
+            )
+        slots.append({"team_slot": slot, "attempts": rendered})
+    return {
+        "unit": "coral-team",
+        "size": size,
+        "team_size": team_size,
+        "target_agent_lanes": size * team_size,
+        "refill_unit": "whole-team",
+        "slots": slots,
+    }
+
+
 def build_bundle(
     *,
     stage_dir: Path,
@@ -132,6 +311,7 @@ def build_bundle(
     cutoff_tails: dict[str, Any],
     llm_models: dict[str, Any] | None = None,
     identity_bindings: dict[str, Any] | None = None,
+    coral_controls: list[dict[str, Any]] | None = None,
 ) -> Bundle:
     ensure_empty_directory(output)
     llm = list(iter_jsonl(stage_dir / "llm.jsonl"))
@@ -140,6 +320,12 @@ def build_bundle(
     graders = list(iter_jsonl(stage_dir / "graders.jsonl"))
     artifacts = list(iter_jsonl(stage_dir / "artifacts.jsonl"))
     spans = list(iter_jsonl(stage_dir / "spans.jsonl"))
+    cutoff_tails = materialize_pre_dispatch_tails(
+        adapter=adapter,
+        llm=llm,
+        dispatches=dispatches,
+        cutoff_tails=cutoff_tails,
+    )
 
     by_actor: dict[str, list[tuple[str, dict[str, Any]]]] = {
         str(actor["actor_id"]): [] for actor in actors
@@ -203,6 +389,11 @@ def build_bundle(
 
     atomic_write_json(output / "terminal.json", terminal)
 
+    concurrency_window = _concurrency_window(
+        adapter=adapter,
+        workload=workload,
+        actors=actors,
+    )
     manifest = {
         "schema_version": MANIFEST_SCHEMA,
         "bundle_id": bundle_id,
@@ -228,6 +419,9 @@ def build_bundle(
         # same logical worker.
         "identity_bindings": dict(identity_bindings or {}),
     }
+    if concurrency_window is not None:
+        manifest["concurrency_window"] = concurrency_window
+        manifest["coral_controls"] = list(coral_controls or [])
     atomic_write_json(output / "manifest.json", manifest)
     return load_bundle(output)
 
@@ -263,18 +457,35 @@ def load_bundle(root: Path) -> Bundle:
         validate_span(span)
     unique_strings((span["span_id"] for span in spans), "spans")
 
-    validate_causal_graph(spans=spans, dispatches=ledgers["dispatch"], tools=ledgers["tool"])
-    validate_artifact_graph(ledgers["artifact"])
-
-    terminal = read_json(root / "terminal.json")
-    validate_terminal(terminal)
-
     cutoff_tails = {
         "operations": records["cutoff-operation"],
         "llm_requests": records["cutoff-llm"],
     }
     _validate_cutoff_tails(cutoff_tails)
     _require_cutoff_tails_disjoint(cutoff_tails, ledgers, llm)
+    validate_causal_graph(
+        spans=spans,
+        dispatches=ledgers["dispatch"],
+        tools=ledgers["tool"],
+        open_parent_span_ids={
+            str(record["span_id"])
+            for record in cutoff_tails["operations"]
+            if record.get("replay_entry") == "enter-and-preserve-descendants"
+            and isinstance(record.get("span_id"), str)
+            and record["span_id"]
+        },
+    )
+    validate_artifact_graph(ledgers["artifact"])
+
+    terminal = read_json(root / "terminal.json")
+    validate_terminal(terminal)
+
+    _require_coral_dispatch_coverage(
+        adapter=str(manifest["adapter"]),
+        llm=llm,
+        dispatches=ledgers["dispatch"],
+        cutoff_tails=cutoff_tails,
+    )
 
     observed = counts_of(
         llm=llm,
@@ -394,10 +605,15 @@ def _validate_cutoff_tails(value: dict[str, Any]) -> None:
             )
             causal_lane = entry.get("causal_lane")
             require(
-                causal_lane is None
-                or (isinstance(causal_lane, str) and bool(causal_lane)),
+                causal_lane is None or (isinstance(causal_lane, str) and bool(causal_lane)),
                 f"cutoff tails: {section} entry has an invalid causal_lane",
             )
+            if section == "operations":
+                require(
+                    entry.get("replay_entry", "block-before-entry")
+                    in {"block-before-entry", "enter-and-preserve-descendants"},
+                    "cutoff tails: operation entry has an invalid replay_entry",
+                )
 
 
 def _require_cutoff_tails_disjoint(
@@ -456,6 +672,273 @@ def _require_actor_coverage(
     unknown = sorted(seen - declared)
     if unknown:
         raise ValidationError(f"bundle records name undeclared actors: {unknown}")
+
+
+def _response_tool_calls(value: Any) -> list[dict[str, Any]]:
+    """Reassemble OpenAI tool calls from streamed or non-streamed responses."""
+
+    by_slot: dict[tuple[int, int], dict[str, str]] = {}
+
+    def consume(payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        choices = payload.get("choices")
+        if not isinstance(choices, list):
+            return
+        for choice_position, choice in enumerate(choices):
+            if not isinstance(choice, dict):
+                continue
+            choice_index = choice.get("index", choice_position)
+            container = choice.get("delta")
+            if not isinstance(container, dict):
+                container = choice.get("message")
+            if not isinstance(container, dict):
+                continue
+            calls = container.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            for call_position, call in enumerate(calls):
+                if not isinstance(call, dict):
+                    continue
+                call_index = call.get("index", call_position)
+                key = (int(choice_index), int(call_index))
+                current = by_slot.setdefault(
+                    key, {"native_call_id": "", "name": "", "raw_arguments": ""}
+                )
+                call_id = call.get("id")
+                if isinstance(call_id, str):
+                    current["native_call_id"] += call_id
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                name = function.get("name")
+                arguments = function.get("arguments")
+                if isinstance(name, str):
+                    current["name"] += name
+                if isinstance(arguments, str):
+                    current["raw_arguments"] += arguments
+
+    chunks = value.get("chunks") if isinstance(value, dict) else None
+    if isinstance(chunks, list):
+        for chunk in chunks:
+            if isinstance(chunk, dict):
+                consume(chunk.get("payload"))
+    else:
+        consume(value)
+
+    result: list[dict[str, Any]] = []
+    for call in by_slot.values():
+        if not call["native_call_id"]:
+            continue
+        try:
+            arguments = json.loads(call["raw_arguments"] or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValidationError(
+                f"completed LLM tool call {call['native_call_id']!r} has invalid arguments"
+            ) from exc
+        require(
+            isinstance(arguments, dict),
+            f"completed LLM tool call {call['native_call_id']!r} arguments are not an object",
+        )
+        result.append({**call, "arguments": arguments})
+    return result
+
+
+def materialize_pre_dispatch_tails(
+    *,
+    adapter: str,
+    llm: list[dict[str, Any]],
+    dispatches: list[dict[str, Any]],
+    cutoff_tails: dict[str, Any],
+) -> dict[str, Any]:
+    """Account for completed model calls whose native dispatch never began.
+
+    This is a recording-boundary rule, not an adapter rule.  The LLM response is
+    fixed work; if the source stopped before dispatch there is correctly no native
+    operation record.  A synthetic zero-duration marker preserves that exact
+    pre-entry boundary so replay can return the captured LLM response without
+    executing a tool the source never entered.
+
+    CORAL's composite ``task`` call is the one adapter-specific extension: when
+    closed child work exists below the unentered parent call, replay enters the
+    parent wrapper only far enough to preserve those descendants.
+    """
+
+    rendered = {
+        "operations": [dict(record) for record in cutoff_tails.get("operations", [])],
+        "llm_requests": [dict(record) for record in cutoff_tails.get("llm_requests", [])],
+    }
+    observed = {
+        (str(record["actor_id"]), str(record["native_call_id"]))
+        for record in [*dispatches, *rendered["operations"]]
+        if isinstance(record.get("native_call_id"), str) and record["native_call_id"]
+    }
+    claimed_child_parents: set[str] = set()
+
+    def child_parent_for(
+        *,
+        actor_id: str,
+        parent_session: str,
+        after_ns: int,
+    ) -> str | None:
+        candidates = sorted(
+            (
+                int(child["started_at_ns"]),
+                str(child["parent_span_id"]),
+            )
+            for child in llm
+            if child.get("actor_id") == actor_id
+            and isinstance(child.get("session_id"), str)
+            and str(child["session_id"]).startswith(f"{parent_session}/child-")
+            and isinstance(child.get("parent_span_id"), str)
+            and child["parent_span_id"]
+            and str(child["parent_span_id"]) not in claimed_child_parents
+            and int(child["started_at_ns"]) >= after_ns
+        )
+        if not candidates:
+            return None
+        parent_span_id = candidates[0][1]
+        claimed_child_parents.add(parent_span_id)
+        return parent_span_id
+
+    for attempt in llm:
+        actor_id = str(attempt["actor_id"])
+        for call in _response_tool_calls(attempt["response"]):
+            native_call_id = str(call["native_call_id"])
+            identity = (actor_id, native_call_id)
+            if identity in observed:
+                continue
+            digest = hashlib.sha256(f"{actor_id}\0{native_call_id}".encode()).hexdigest()[:24]
+            arguments = call["arguments"]
+            parent_session = str(attempt.get("session_id") or "")
+            child_parent_span = (
+                child_parent_for(
+                    actor_id=actor_id,
+                    parent_session=parent_session,
+                    after_ns=int(attempt["ended_at_ns"]),
+                )
+                if adapter == "coral" and call["name"] == "task" and parent_session
+                else None
+            )
+            replay_entry = (
+                "enter-and-preserve-descendants"
+                if child_parent_span is not None
+                else "block-before-entry"
+            )
+            dispatch_id = f"predispatch-{digest}"
+            dispatch_span_id = f"span-predispatch-{digest}"
+            common = {
+                "cutoff_truncated": True,
+                "pre_dispatch": child_parent_span is None,
+                "replay_entry": replay_entry,
+                "actor_id": actor_id,
+                "process_role": attempt.get("process_role", "agent"),
+                "lane": f"model-call:{native_call_id}",
+                "causal_lane": f"model-call:{native_call_id}",
+                "session_id": attempt.get("session_id"),
+                "origin": {
+                    "kind": "llm_structured",
+                    "trigger_id": attempt["attempt_id"],
+                    "model_call_id": native_call_id,
+                },
+                "name": call["name"],
+                "arguments": arguments,
+                "native_arguments": arguments,
+                "arguments_sha256": sha256_json(arguments),
+                "source_started_at_ns": attempt["ended_at_ns"],
+                "elapsed_ns": 0,
+            }
+            rendered["operations"].append(
+                {
+                    **common,
+                    "kind": "dispatch",
+                    "dispatch_id": dispatch_id,
+                    "record_id": dispatch_id,
+                    "span_id": dispatch_span_id,
+                    "parser_identity": "opencode.message.part.tool",
+                    "dispatcher_identity": "opencode.tool.execute.before",
+                    "native_call_id": native_call_id,
+                }
+            )
+            if child_parent_span is not None:
+                tool_id = f"pretool-{digest}"
+                rendered["operations"].append(
+                    {
+                        **common,
+                        "pre_dispatch": False,
+                        "kind": "tool",
+                        "call_id": tool_id,
+                        "record_id": tool_id,
+                        # The child LLM spans already name the live task tool as
+                        # their parent. Reuse that exact missing span identity to
+                        # reconnect the closed descendant graph.
+                        "span_id": child_parent_span,
+                        "parent_span_id": dispatch_span_id,
+                        "dispatch_id": dispatch_id,
+                        "implementation": "opencode-native-replay-plugin",
+                        "result_contract": {
+                            "schema_version": "native-agent-replay.result-contract/v2",
+                            "kind": "recorded-observation",
+                            "fields": [
+                                {"json_pointer": "/output", "optional": True},
+                                {"json_pointer": "/error", "optional": True},
+                                {
+                                    "json_pointer": "/metadata/parentSessionId",
+                                    "optional": True,
+                                },
+                                {
+                                    "json_pointer": "/metadata/sessionId",
+                                    "optional": True,
+                                },
+                            ],
+                        },
+                    }
+                )
+            observed.add(identity)
+    return rendered
+
+
+def _require_coral_dispatch_coverage(
+    *,
+    adapter: str,
+    llm: list[dict[str, Any]],
+    dispatches: list[dict[str, Any]],
+    cutoff_tails: dict[str, Any],
+) -> None:
+    """CORAL must account for every provider-emitted tool call.
+
+    OpenCode normally publishes ``tool.execute.before``, but built-in tools can
+    bypass that hook. Without this gate a source bundle can silently omit the
+    parent operation and causal closure can then discard completed subagent work.
+    """
+
+    if adapter != "coral":
+        return
+
+    emitted = {
+        (str(record["actor_id"]), call_id)
+        for record in llm
+        for call_id in (
+            str(call["native_call_id"]) for call in _response_tool_calls(record["response"])
+        )
+    }
+    observed = {
+        (str(record["actor_id"]), str(record["native_call_id"]))
+        for record in dispatches
+        if isinstance(record.get("native_call_id"), str) and record["native_call_id"]
+    }
+    observed.update(
+        (str(record["actor_id"]), str(record["native_call_id"]))
+        for record in cutoff_tails["operations"]
+        if isinstance(record.get("native_call_id"), str) and record["native_call_id"]
+    )
+    missing = sorted(emitted - observed)
+    if missing:
+        sample = ", ".join(f"{actor}:{call_id}" for actor, call_id in missing[:5])
+        suffix = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
+        raise ValidationError(
+            f"CORAL LLM tool calls have no dispatch or cutoff evidence: {sample}{suffix}"
+        )
 
 
 def bundle_id_for(workload: dict[str, Any]) -> str:

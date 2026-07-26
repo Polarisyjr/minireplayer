@@ -140,7 +140,12 @@ def _causal_lane_lock(
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def bind_task_lane(source_actor_id: str, native_lane_key: str | None = None) -> str:
+def bind_task_lane(
+    source_actor_id: str,
+    native_lane_key: str | None = None,
+    *,
+    actor_metadata: dict[str, Any] | None = None,
+) -> str:
     """Bind one native task/session to a causal lane.
 
     Adapters which own a refill scheduler pass its stable, process-local execution
@@ -156,6 +161,8 @@ def bind_task_lane(source_actor_id: str, native_lane_key: str | None = None) -> 
         not isinstance(native_lane_key, str) or not native_lane_key
     ):
         raise InfrastructureError("native lane key must be a non-empty string")
+    if actor_metadata is not None and not isinstance(actor_metadata, dict):
+        raise InfrastructureError("actor metadata must be an object")
     resolved = resolve_actor(source_actor_id)
     pid = os.getpid()
     with _LOCK:
@@ -171,19 +178,22 @@ def bind_task_lane(source_actor_id: str, native_lane_key: str | None = None) -> 
                 f"native task {source_actor_id!r} changed lanes: {previous!r} -> {actor_id!r}"
             )
         binding_dir = os.environ.get("NATIVE_REPLAY_LANE_BINDING_DIR")
-        if first_binding and native_lane_key is not None and binding_dir:
+        if first_binding and (native_lane_key is not None or actor_metadata) and binding_dir:
             sequence = _BINDING_SEQUENCE
             _BINDING_SEQUENCE += 1
+            value = {
+                "schema_version": "native-agent-replay.lane-binding/v1",
+                "actor_id": actor_id,
+                "source_actor_id": source_actor_id,
+                "native_lane_key": native_lane_key,
+                "pid": pid,
+                "bound_at_ns": monotonic_ns(),
+            }
+            if actor_metadata:
+                value["actor_metadata"] = actor_metadata
             atomic_write_json(
                 Path(binding_dir) / f"{pid}-{sequence:06d}.json",
-                {
-                    "schema_version": "native-agent-replay.lane-binding/v1",
-                    "actor_id": actor_id,
-                    "source_actor_id": source_actor_id,
-                    "native_lane_key": native_lane_key,
-                    "pid": pid,
-                    "bound_at_ns": monotonic_ns(),
-                },
+                value,
             )
         return actor_id
 
@@ -196,8 +206,13 @@ def ready_and_wait(
     session_id: str | None = None,
     llm_role: str | None = None,
     target_id: str | None = None,
+    actor_metadata: dict[str, Any] | None = None,
 ) -> tuple[Any, ...]:
-    actor_id = bind_task_lane(source_actor_id, native_lane_key)
+    actor_id = bind_task_lane(
+        source_actor_id,
+        native_lane_key,
+        actor_metadata=actor_metadata,
+    )
     target_id = target_id or target_for_actor(actor_id)
     key = (os.getpid(), actor_id)
     with _LOCK:
@@ -226,18 +241,18 @@ def ready_and_wait(
             target_id=target_id,
         )
     ready_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(
-        ready_dir / f"{actor_id}.json",
-        {
-            "schema_version": "native-agent-replay.actor-ready/v1",
-            "run_id": run_id,
-            "actor_id": actor_id,
-            "source_actor_id": source_actor_id,
-            "process_role": process_role,
-            "pid": os.getpid(),
-            "ready_at_ns": monotonic_ns(),
-        },
-    )
+    ready = {
+        "schema_version": "native-agent-replay.actor-ready/v1",
+        "run_id": run_id,
+        "actor_id": actor_id,
+        "source_actor_id": source_actor_id,
+        "process_role": process_role,
+        "pid": os.getpid(),
+        "ready_at_ns": monotonic_ns(),
+    }
+    if actor_metadata:
+        ready["actor_metadata"] = actor_metadata
+    atomic_write_json(ready_dir / f"{actor_id}.json", ready)
     timeout_s = float(os.environ.get("NATIVE_REPLAY_GATE_TIMEOUT_S", "1800"))
     deadline = time.monotonic() + timeout_s
     while not gate.is_file():

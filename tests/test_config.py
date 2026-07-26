@@ -61,6 +61,76 @@ def test_refill_and_legacy_load_model_cannot_both_be_set(tmp_path: Path) -> None
         load_config(write_config(tmp_path, refill=False, load_model="fire-once"))
 
 
+def test_coral_turn_controls_round_trip_and_define_workload_identity(tmp_path: Path) -> None:
+    config = load_config(
+        write_config(
+            tmp_path,
+            framework="coral",
+            coral_agent_turns=3,
+            coral_global_turns=8,
+            coral_restart_exited=True,
+        )
+    )
+
+    assert config.coral_agent_turns == 3
+    assert config.coral_global_turns == 8
+    assert config.coral_restart_exited is True
+    assert config.to_json()["coral_global_turns"] == 8
+    assert config.to_json()["coral_team_size"] == 4
+    assert config.workload_identity() == {
+        "framework": "coral",
+        "concurrency": 8,
+        "duration_s": 60,
+        "seed": 42,
+        "refill": True,
+        "concurrency_unit": "coral-team",
+        "coral_team_size": 4,
+        "coral_dataset": "frontier_cs_algo",
+        "coral_agent_turns": 3,
+        "coral_global_turns": 8,
+        "coral_restart_exited": True,
+    }
+
+
+def test_formal_defaults_are_three_minutes_and_restarting_coral(tmp_path: Path) -> None:
+    path = write_config(tmp_path, framework="coral")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value.pop("duration_s")
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.duration_s == 180
+    assert config.coral_agent_turns == 100
+    assert config.coral_global_turns == 10
+    assert config.coral_restart_exited is True
+
+
+def test_coral_team_size_is_fixed_at_four(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="coral_team_size must be 4"):
+        load_config(
+            write_config(
+                tmp_path,
+                framework="coral",
+                coral_team_size=3,
+            )
+        )
+
+
+@pytest.mark.parametrize("value", (1, 3))
+def test_coral_global_turns_cannot_be_smaller_than_initial_team(
+    tmp_path: Path, value: int
+) -> None:
+    with pytest.raises(ValidationError, match="four initial CORAL agents"):
+        load_config(
+            write_config(
+                tmp_path,
+                framework="coral",
+                coral_global_turns=value,
+            )
+        )
+
+
 def test_serving_gpu_mode_defaults_to_nvidia(tmp_path: Path) -> None:
     config = load_config(
         write_config(tmp_path, serving={"configs": ["serving/configs/test.yaml:1"]})

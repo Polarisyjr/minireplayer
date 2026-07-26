@@ -66,7 +66,12 @@ def local_start(
     actor_id = payload.get("actor_id")
     require(isinstance(actor_id, str) and bool(actor_id), "local boundary actor is required")
     session_id = str(payload.get("session_id") or actor_id)
-    record_id = f"{_ID_PREFIX[kind]}-{secrets.token_hex(12)}"
+    hint = payload.get("record_id_hint")
+    record_id = (
+        str(hint)
+        if isinstance(hint, str) and hint
+        else f"{_ID_PREFIX[kind]}-{secrets.token_hex(12)}"
+    )
     span_id = f"span-{secrets.token_hex(12)}"
     reservation_id = secrets.token_urlsafe(24)
     append_lane_event(
@@ -295,7 +300,10 @@ def materialize_lane_recording(
             if int(event["at_ns"]) > cutoff_at_ns:
                 continue
             payload = dict(event["payload"])
-            payload["record_id_hint"] = str(event["record_id"])
+            # Older lane logs may have ignored an adapter-supplied stable ID at
+            # append time. Preserve that original hint when materializing so
+            # artifact read_from/grader references resolve to the producer.
+            payload.setdefault("record_id_hint", str(event["record_id"]))
             payload["span_id_hint"] = str(event["span_id"])
             opened = ledger.start(payload)
             reservations[local_id] = str(opened["reservation_id"])

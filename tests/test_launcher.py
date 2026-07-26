@@ -15,9 +15,12 @@ REPO = Path("/repo")
 def config(
     framework: str,
     concurrency: int = 1,
-    duration_s: int = 1200,
+    duration_s: int = 180,
     refill: bool = True,
     env: dict[str, str] | None = None,
+    coral_agent_turns: int = 100,
+    coral_global_turns: int = 10,
+    coral_restart_exited: bool = True,
 ) -> RunConfig:
     return RunConfig(
         framework=framework,
@@ -28,6 +31,9 @@ def config(
         targets={"vllm-8000": "http://127.0.0.1:8000"},
         refill=refill,
         env={} if env is None else env,
+        coral_agent_turns=coral_agent_turns,
+        coral_global_turns=coral_global_turns,
+        coral_restart_exited=coral_restart_exited,
     )
 
 
@@ -48,9 +54,36 @@ def test_command_is_the_seeded_sweep_with_no_profiler(framework: str, concurrenc
         "-s",
         "none",
         "-d",
-        "1200",
+        "180",
     ]
+    if framework == "coral":
+        expected += [
+            "--agent-turns",
+            "100",
+            "--global-turns",
+            "10",
+            "--restart-exited",
+        ]
     assert list(command) == expected
+
+
+def test_coral_turn_and_restart_controls_are_passed_to_the_native_sweep() -> None:
+    command = sweep_command(
+        config(
+            "coral",
+            coral_agent_turns=3,
+            coral_global_turns=8,
+            coral_restart_exited=True,
+        )
+    )
+
+    assert command[-5:] == (
+        "--agent-turns",
+        "3",
+        "--global-turns",
+        "8",
+        "--restart-exited",
+    )
 
 
 def test_no_task_selection_flag_is_ever_passed() -> None:
