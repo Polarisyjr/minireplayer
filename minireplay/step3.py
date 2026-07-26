@@ -24,35 +24,20 @@ from .util import atomic_write, atomic_write_json, canonical_json
 STEP3_SCHEMA = "minireplay.step3/v1"
 
 
-def _visual_chain(actor: str, session_id: Any) -> str:
-    """Keep child-session work on the owning CORAL agent lane.
+def _child_session(actor: str, session_id: Any) -> str | None:
+    """Name the OpenCode subagent session a row belongs to, if any.
 
-    A CORAL subagent is an OpenCode session nested inside one agent invocation,
-    not another independently scheduled CORAL lane.  The session remains on each
-    raw row for audit, while the dashed ``task`` scope shows the nesting.
+    A CORAL subagent is a session nested inside one agent invocation, not another
+    independently scheduled lane, so its work stays on the owning agent's lane.
+    The session is annotated on each raw row for audit, while the dashed ``task``
+    scope shows the nesting.
     """
 
-    del session_id
-    return actor
-
-
-def _child_session(actor: str, session_id: Any) -> str | None:
     if not isinstance(session_id, str) or "/child-" not in session_id:
         return None
     if not session_id.startswith(f"{actor}/"):
         return None
     return session_id
-
-
-def _chain_actor(chain: str) -> str:
-    return chain.split("::", 1)[0]
-
-
-def _chain_session(chain: str) -> str | None:
-    if "::" not in chain:
-        return None
-    actor, relative = chain.split("::", 1)
-    return f"{actor}/{relative}"
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -115,32 +100,31 @@ def _llm_rows(
         response = record.get("response")
         request_id = response.get("id") if isinstance(response, dict) else None
         actor = str(record.get("actor_id") or "?")
-        chain = _visual_chain(actor, record.get("session_id"))
         row = {
-                "ts_start": _epoch(
-                    int(record["started_at_ns"]),
-                    gate_at_ns=gate_at_ns,
-                    gate_at_epoch_ns=gate_at_epoch_ns,
-                    terminal_at_ns=terminal_at_ns,
-                ),
-                "ts_end": _epoch(
-                    int(record["ended_at_ns"]),
-                    gate_at_ns=gate_at_ns,
-                    gate_at_epoch_ns=gate_at_epoch_ns,
-                    terminal_at_ns=terminal_at_ns,
-                ),
-                "role": str(record.get("role") or "agent"),
-                "chain": chain,
-                "port": _port(record.get("target_id")),
-                "request_id": request_id or record.get("attempt_id"),
-                "prompt_tokens": len(record.get("prompt_token_ids") or []),
-                "completion_tokens": len(record.get("response_token_ids") or []),
-                "e2e_s": round(
-                    (int(record["ended_at_ns"]) - int(record["started_at_ns"])) / 1e9,
-                    6,
-                ),
-                "source": "minireplay-llm-boundary",
-            }
+            "ts_start": _epoch(
+                int(record["started_at_ns"]),
+                gate_at_ns=gate_at_ns,
+                gate_at_epoch_ns=gate_at_epoch_ns,
+                terminal_at_ns=terminal_at_ns,
+            ),
+            "ts_end": _epoch(
+                int(record["ended_at_ns"]),
+                gate_at_ns=gate_at_ns,
+                gate_at_epoch_ns=gate_at_epoch_ns,
+                terminal_at_ns=terminal_at_ns,
+            ),
+            "role": str(record.get("role") or "agent"),
+            "chain": actor,
+            "port": _port(record.get("target_id")),
+            "request_id": request_id or record.get("attempt_id"),
+            "prompt_tokens": len(record.get("prompt_token_ids") or []),
+            "completion_tokens": len(record.get("response_token_ids") or []),
+            "e2e_s": round(
+                (int(record["ended_at_ns"]) - int(record["started_at_ns"])) / 1e9,
+                6,
+            ),
+            "source": "minireplay-llm-boundary",
+        }
         if (session_id := _child_session(actor, record.get("session_id"))) is not None:
             row["actor_chain"] = actor
             row["session_id"] = session_id
@@ -154,30 +138,29 @@ def _llm_rows(
             terminal_at_ns=terminal_at_ns,
         )
         actor = str(tail.get("actor_id") or "?")
-        chain = _visual_chain(actor, tail.get("session_id"))
         row = {
-                "ts_start": _epoch(
-                    started,
-                    gate_at_ns=gate_at_ns,
-                    gate_at_epoch_ns=gate_at_epoch_ns,
-                    terminal_at_ns=terminal_at_ns,
-                ),
-                "ts_end": _epoch(
-                    ended,
-                    gate_at_ns=gate_at_ns,
-                    gate_at_epoch_ns=gate_at_epoch_ns,
-                    terminal_at_ns=terminal_at_ns,
-                ),
-                "role": str(tail.get("role") or "agent"),
-                "chain": chain,
-                "port": _port(tail.get("target_id")),
-                "request_id": tail.get("attempt_id"),
-                "prompt_tokens": None,
-                "completion_tokens": None,
-                "e2e_s": round((ended - started) / 1e9, 6),
-                "timeline_kind": "truncated",
-                "source": "minireplay-cutoff-tail",
-            }
+            "ts_start": _epoch(
+                started,
+                gate_at_ns=gate_at_ns,
+                gate_at_epoch_ns=gate_at_epoch_ns,
+                terminal_at_ns=terminal_at_ns,
+            ),
+            "ts_end": _epoch(
+                ended,
+                gate_at_ns=gate_at_ns,
+                gate_at_epoch_ns=gate_at_epoch_ns,
+                terminal_at_ns=terminal_at_ns,
+            ),
+            "role": str(tail.get("role") or "agent"),
+            "chain": actor,
+            "port": _port(tail.get("target_id")),
+            "request_id": tail.get("attempt_id"),
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "e2e_s": round((ended - started) / 1e9, 6),
+            "timeline_kind": "truncated",
+            "source": "minireplay-cutoff-tail",
+        }
         if (session_id := _child_session(actor, tail.get("session_id"))) is not None:
             row["actor_chain"] = actor
             row["session_id"] = session_id
@@ -199,8 +182,7 @@ def _tool_rows(
 
     def add(record: dict[str, Any], *, truncated: bool) -> None:
         actor = str(record.get("actor_id") or "?")
-        chain = _visual_chain(actor, record.get("session_id"))
-        steps[chain] += 1
+        steps[actor] += 1
         started = int(record.get("started_at_ns", record.get("source_started_at_ns", gate_at_ns)))
         ended = (
             _tail_end_ns(
@@ -225,12 +207,12 @@ def _tool_rows(
                 gate_at_epoch_ns=gate_at_epoch_ns,
                 terminal_at_ns=terminal_at_ns,
             ),
-            "chain": chain,
+            "chain": actor,
             "stage": "agent",
             "tool": str(record.get("name") or "tool"),
             "tools": None,
             "success": status in {"ok", "executed", "success"},
-            "step": steps[chain],
+            "step": steps[actor],
             "n_calls": 1,
             "source": "minireplay-cutoff-tail" if truncated else "minireplay-tool-boundary",
         }
@@ -453,29 +435,26 @@ def _composite_rows(
     rows: list[dict[str, Any]] = []
     for record in records:
         actor = str(record["actor_id"])
-        chain = _visual_chain(actor, record.get("session_id"))
         row = {
-                "scope_id": record["scope_id"],
-                "chain": chain,
-                "name": record["name"],
-                "causal_lane": record["causal_lane"],
-                "ts_start": _epoch(
-                    int(record["started_at_ns"]),
-                    gate_at_ns=gate_at_ns,
-                    gate_at_epoch_ns=gate_at_epoch_ns,
-                    terminal_at_ns=terminal_at_ns,
-                ),
-                "ts_end": _epoch(
-                    int(record["ended_at_ns"]),
-                    gate_at_ns=gate_at_ns,
-                    gate_at_epoch_ns=gate_at_epoch_ns,
-                    terminal_at_ns=terminal_at_ns,
-                ),
-                "timeline_kind": (
-                    "truncated" if record.get("cutoff_truncated") is True else "scope"
-                ),
-                "source": "minireplay-composite-scope",
-            }
+            "scope_id": record["scope_id"],
+            "chain": actor,
+            "name": record["name"],
+            "causal_lane": record["causal_lane"],
+            "ts_start": _epoch(
+                int(record["started_at_ns"]),
+                gate_at_ns=gate_at_ns,
+                gate_at_epoch_ns=gate_at_epoch_ns,
+                terminal_at_ns=terminal_at_ns,
+            ),
+            "ts_end": _epoch(
+                int(record["ended_at_ns"]),
+                gate_at_ns=gate_at_ns,
+                gate_at_epoch_ns=gate_at_epoch_ns,
+                terminal_at_ns=terminal_at_ns,
+            ),
+            "timeline_kind": ("truncated" if record.get("cutoff_truncated") is True else "scope"),
+            "source": "minireplay-composite-scope",
+        }
         if (session_id := _child_session(actor, record.get("session_id"))) is not None:
             row["actor_chain"] = actor
             row["session_id"] = session_id
@@ -708,30 +687,18 @@ def _write_text(
 
 
 def _lane_label(actor: str, actor_lanes: dict[str, dict[str, Any]]) -> str:
-    chain = actor
-    actor = _chain_actor(chain)
     lane = actor_lanes.get(actor)
     if not isinstance(lane, dict) or lane.get("concurrency_unit") != "coral-team":
-        base = actor
-    else:
-        source = str(lane.get("source_task_id") or "")
-        task = source.rsplit("/", 1)[-1] if source else actor
-        if lane.get("lane_kind") == "agent":
-            base = (
-                f"slot-{int(lane['team_slot']):02d}/"
-                f"g{int(lane['slot_generation']):02d}/"
-                f"{lane['agent_id']} · {task}"
-            )
-        else:
-            base = (
-                f"slot-{int(lane['team_slot']):02d}/"
-                f"g{int(lane['slot_generation']):02d}/team · {task}"
-            )
-    session = _chain_session(chain)
-    if session is None:
-        return base
-    relative = session.removeprefix(f"{actor}/")
-    return f"↳ {base}/{relative} · subagent"
+        return actor
+    source = str(lane.get("source_task_id") or "")
+    task = source.rsplit("/", 1)[-1] if source else actor
+    if lane.get("lane_kind") == "agent":
+        return (
+            f"slot-{int(lane['team_slot']):02d}/"
+            f"g{int(lane['slot_generation']):02d}/"
+            f"{lane['agent_id']} · {task}"
+        )
+    return f"slot-{int(lane['team_slot']):02d}/g{int(lane['slot_generation']):02d}/team · {task}"
 
 
 def _lane_sort_key(
@@ -739,9 +706,6 @@ def _lane_sort_key(
     first_start: dict[str, float],
     actor_lanes: dict[str, dict[str, Any]],
 ) -> tuple[Any, ...]:
-    chain = actor
-    actor = _chain_actor(chain)
-    child = _chain_session(chain)
     lane = actor_lanes.get(actor)
     if isinstance(lane, dict) and lane.get("concurrency_unit") == "coral-team":
         return (
@@ -749,11 +713,9 @@ def _lane_sort_key(
             int(lane.get("team_slot", -1)),
             int(lane.get("slot_generation", -1)),
             int(lane.get("agent_index", 0)),
-            0 if child is None else 1,
-            child or "",
-            chain,
+            actor,
         )
-    return (1, first_start[chain], actor, 0 if child is None else 1, child or "")
+    return (1, first_start[actor], actor)
 
 
 def _render_png(
@@ -766,7 +728,6 @@ def _render_png(
     termination_rows: list[dict[str, Any]],
     gate_epoch_s: float,
     window_s: float,
-    gaps: list[dict[str, Any]],
     view_kind: str,
     actor_lanes: dict[str, dict[str, Any]],
 ) -> None:
@@ -807,10 +768,11 @@ def _render_png(
     # first two actor lanes — exactly where long browser composites tend to be.
     fig, ax = plt.subplots(figsize=(18, height))
 
-    # A gap is represented by literal white space.  Coloring every globally idle
-    # interval red made "no LLM/tool right now" look like a cutoff, especially
-    # when a CORAL restart control was still pending.  Actual team termination
-    # has its own exact red tick and hatched post-cutoff region below.
+    # An idle interval is represented by literal white space, so this draws no
+    # gap shading.  Coloring every globally idle interval red made "no LLM/tool
+    # right now" look like a cutoff, especially when a CORAL restart control was
+    # still pending.  Actual team termination has its own exact red tick and
+    # hatched post-cutoff region below.
 
     # Composite orchestration is context, not replayable work. Draw only an
     # unfilled envelope behind its child LLM/tool spans; it must never hide them
@@ -880,9 +842,8 @@ def _render_png(
     for row in termination_rows:
         actor = str(row["chain"])
         at = float(row["seconds_since_gate"])
-        for chain, y in lane_y.items():
-            if _chain_actor(chain) != actor:
-                continue
+        y = lane_y.get(actor)
+        if y is not None:
             ax.broken_barh(
                 [(at, max(0.0, window_s - at))],
                 (y - 0.4, 0.8),
@@ -903,7 +864,7 @@ def _render_png(
         )
         previous_group: tuple[int, int] | None = None
         for y, actor in enumerate(ordered):
-            lane = actor_lanes.get(_chain_actor(actor), {})
+            lane = actor_lanes.get(actor, {})
             if lane.get("concurrency_unit") != "coral-team":
                 continue
             group = (int(lane["team_slot"]), int(lane["slot_generation"]))
@@ -1115,7 +1076,6 @@ def export_step3(
         termination_rows=termination_rows,
         gate_epoch_s=gate_epoch_s,
         window_s=timeline["window_s"],
-        gaps=timeline["gaps"],
         view_kind=view_kind,
         actor_lanes=actor_lanes,
     )
