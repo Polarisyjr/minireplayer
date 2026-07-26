@@ -4,6 +4,7 @@ import contextvars
 import json
 import os
 import threading
+from functools import lru_cache
 from time import monotonic_ns
 from typing import Any
 
@@ -89,6 +90,21 @@ print(
 PY"""
 
 
+@lru_cache(maxsize=1)
+def _pin_cpu_hooks():
+    """Load the optional external placement hook only for declared experiments."""
+
+    if not os.environ.get("PIN_CPU_POLICY_PATH"):
+        return None
+    try:
+        from pin_cpu import hooks
+    except ImportError as exc:
+        raise RuntimeError(
+            "PIN_CPU_POLICY_PATH is set but the pin_cpu package is not importable"
+        ) from exc
+    return hooks
+
+
 def _environment_factory(original):
     def wrapped(config, instance):
         source_actor = str(instance.get("instance_id", ""))
@@ -115,6 +131,7 @@ def _container_start_factory(original):
         run_id = os.environ["NATIVE_REPLAY_RUN_ID"]
         label = f"native-replay.run={run_id}"
         run_args = list(self.config.run_args)
+        actor = current_context()["actor_id"]
         cpuset = declared_docker_cpuset()
         if cpuset is not None:
             if any(
@@ -122,6 +139,49 @@ def _container_start_factory(original):
             ):
                 raise RuntimeError("mini-swe Docker run already declares a CPU set")
             run_args.extend(["--cpuset-cpus", cpuset])
+        hooks = _pin_cpu_hooks()
+        placement = None
+        if hooks is not None:
+            if cpuset is not None:
+                raise RuntimeError(
+                    "pin_cpu placement cannot be combined with config.cpuset"
+                )
+            placement = hooks.container_placement(str(actor))
+            for option, value in (
+                ("--cpuset-cpus", placement["cpus"]),
+                ("--cpuset-mems", placement["mems"]),
+            ):
+                if value is None:
+                    continue
+                if any(
+                    item == option or item.startswith(f"{option}=") for item in run_args
+                ):
+                    raise RuntimeError(
+                        f"mini-swe Docker run already declares {option}"
+                    )
+                run_args.extend([option, str(value)])
+            for name, value in sorted(placement["labels"].items()):
+                run_args.extend(["--label", f"{name}={value}"])
+            for name, value in sorted(placement.get("env", {}).items()):
+                if any(
+                    item == "--env" and following.split("=", 1)[0] == name
+                    for item, following in zip(run_args, run_args[1:], strict=False)
+                ):
+                    raise RuntimeError(
+                        f"mini-swe Docker run already declares --env {name}"
+                    )
+                run_args.extend(["--env", f"{name}={value}"])
+            cgroup_parent = placement.get("cgroup_parent")
+            if cgroup_parent is not None:
+                if any(
+                    item == "--cgroup-parent"
+                    or item.startswith("--cgroup-parent=")
+                    for item in run_args
+                ):
+                    raise RuntimeError(
+                        "mini-swe Docker run already declares --cgroup-parent"
+                    )
+                run_args.extend(["--cgroup-parent", str(cgroup_parent)])
         for index, value in enumerate(run_args):
             if (
                 value == "--label"
@@ -130,11 +190,32 @@ def _container_start_factory(original):
             ):
                 raise RuntimeError("mini-swe Docker run already has a replay ownership label")
         run_args.extend(["--label", label, "--label", "native-replay.role=mini-swe-workspace"])
-        actor = current_context()["actor_id"]
         if actor != "unknown":
             run_args.extend(["--label", f"native-replay.actor={actor}"])
         self.config.run_args = run_args
-        return original(self, *args, **kwargs)
+        self._pin_cpu_actor = str(actor) if hooks is not None and placement is not None else None
+        try:
+            return original(self, *args, **kwargs)
+        except Exception:
+            if hooks is not None and self._pin_cpu_actor is not None:
+                hooks.release_container(self._pin_cpu_actor)
+                self._pin_cpu_actor = None
+            raise
+
+    return wrapped
+
+
+def _container_cleanup_factory(original):
+    def wrapped(self, *args, **kwargs):
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            actor = getattr(self, "_pin_cpu_actor", None)
+            if actor is not None:
+                hooks = _pin_cpu_hooks()
+                if hooks is not None:
+                    hooks.release_container(actor)
+                self._pin_cpu_actor = None
 
     return wrapped
 
@@ -281,6 +362,37 @@ def _docker_execute_factory(original):
                 semantic_timeout_s=semantic_timeout_s,
             )
             native_children: list[dict[str, Any]] = []
+            original_interpreter = None
+            if os.environ.get("PIN_CPU_TOOL_AFFINITY") == "1":
+                hooks = _pin_cpu_hooks()
+                if hooks is None:
+                    raise RuntimeError(
+                        "PIN_CPU_TOOL_AFFINITY needs a declared pin_cpu policy"
+                    )
+                tool_cpus = hooks.tool_cpu_set(action)
+                if tool_cpus is None:
+                    raise RuntimeError(
+                        "PIN_CPU_TOOL_AFFINITY is enabled for a non-tool policy"
+                    )
+                original_interpreter = list(self.config.interpreter)
+                if original_interpreter[:1] == ["taskset"]:
+                    # The prefix is applied by mutating a field shared by the whole
+                    # environment, which is safe only because mini-swe runs one
+                    # action at a time per container. A nested entry would silently
+                    # bind this action to the outer action's CPUs and leak the
+                    # prefix into every later action, so fail instead.
+                    raise RuntimeError(
+                        "mini-swe interpreter already carries a pin_cpu affinity prefix"
+                    )
+                # taskset sets affinity and execs the existing interpreter in the
+                # same container process. There is no host wrapper or polling
+                # controller in this measured path.
+                self.config.interpreter = [
+                    "taskset",
+                    "-c",
+                    tool_cpus,
+                    *original_interpreter,
+                ]
             try:
                 with capture_subprocess_launches() as native_children:
                     result = original(self, action, cwd, timeout=timeout)
@@ -305,6 +417,9 @@ def _docker_execute_factory(original):
                     native_execution=True,
                 )
                 raise
+            finally:
+                if original_interpreter is not None:
+                    self.config.interpreter = original_interpreter
             extra = result.get("extra")
             completion = boundary.complete(
                 reservation["reservation_id"],
@@ -464,6 +579,10 @@ def install() -> None:
         lambda original: _parse_actions_factory(original, FormatError),
     )
     patch_method(DockerEnvironment, "_start_container", _container_start_factory)
+    if _pin_cpu_hooks() is not None:
+        # Only a declared placement experiment needs the slot to be returned, and
+        # only it may depend on this framework version owning a ``cleanup`` method.
+        patch_method(DockerEnvironment, "cleanup", _container_cleanup_factory)
     patch_method(DockerEnvironment, "execute", _docker_execute_factory)
     state().mark("mini-swe-agent-gate")
     state().mark("mini-swe-environment-actor-binding")

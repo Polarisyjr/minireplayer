@@ -556,6 +556,24 @@ class Supervisor:
             audit_namespace=self.run_id,
         )
         metrics = RunMetrics(gpu=GPUSampler(self.config.gpu_ids), cgroup=cgroup)
+        usage = None
+        usage_path = self.config.env.get("PIN_CPU_USAGE_PATH")
+        if usage_path:
+            from pin_cpu.usage import UsageCollector
+
+            usage = UsageCollector(
+                run_id=self.run_id,
+                output=Path(usage_path),
+                include_vllm=not (
+                    self.mode == "replay" and self.replay_mode == "tool-only"
+                ),
+                policy_path=Path(self.config.env["PIN_CPU_POLICY_PATH"]),
+                sample_interval_ms=(
+                    int(self.config.env["PIN_CPU_SAMPLE_INTERVAL_MS"])
+                    if self.config.env.get("PIN_CPU_SAMPLE_INTERVAL_MS")
+                    else None
+                ),
+            )
         process: subprocess.Popen | None = None
         failure: BaseException | None = None
         reason = "unknown"
@@ -570,6 +588,8 @@ class Supervisor:
             self._wait_actors_ready(process, timeout_s=max(600.0, self.config.duration_s))
             services.assert_healthy()
 
+            if usage is not None:
+                usage.mark_before_gate()
             gate_at_ns = self._open_gate()
             metrics.mark_gate(gate_at_ns)
 
@@ -584,11 +604,18 @@ class Supervisor:
             # Let them drain before anything reads those files.
             wait_until(lambda: services.boundary.active_writes == 0, timeout_s=5.0)
             metrics.mark_terminal(terminal_at_ns)
+            if usage is not None:
+                usage.mark_terminal(
+                    gate_at_ns=gate_at_ns,
+                    terminal_at_ns=terminal_at_ns,
+                )
         except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised
             failure = exc
             if metrics.terminal_at_ns == 0:
                 metrics.mark_terminal(monotonic_ns())
         finally:
+            if usage is not None:
+                usage.close()
             if process is not None:
                 self._stop_native(process)
             cgroup.kill()
