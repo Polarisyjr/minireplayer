@@ -5,9 +5,10 @@ import json
 import os
 import threading
 from functools import lru_cache
-from time import monotonic_ns
+from time import monotonic_ns, sleep
 from typing import Any
 
+from minireplay.errors import MismatchError
 from minireplay.observation import recorded_output_result_contract
 from minireplay.placement import declared_docker_cpuset
 from minireplay.sdk import (
@@ -261,6 +262,41 @@ def _logical_container_children(
     return normalized
 
 
+def _simulate_tool(
+    boundary: BoundaryClient,
+    reservation: dict[str, Any],
+    simulated: dict[str, Any],
+) -> Any:
+    """Hold the lane for the recorded duration, then return the recorded result.
+
+    ``llm-only`` replay measures the LLM lane, so this tool never enters its
+    native implementation. Waiting out the source's own duration is what keeps
+    the engine's request arrival pattern comparable to a full replay; returning
+    at once would change its batching and cache pressure into a different
+    workload. The ledger records ``native_execution: False`` so the evidence
+    stays honest about what did not run.
+    """
+
+    sleep(max(0, int(simulated["elapsed_ns"])) / 1e9)
+    completion = boundary.complete(
+        reservation["reservation_id"],
+        status=str(simulated["status"]),
+        result=None,
+        logical_frames=[],
+        side_effects={},
+        child_processes=[],
+        native_execution=False,
+        cpu_seconds=0.0,
+    )
+    if completion.get("framework_exception") is not None:
+        # mini-swe reproduces a recorded terminal exception by re-running the
+        # command. Without that execution there is nothing to raise it from.
+        raise MismatchError("llm-only replay cannot restore a recorded tool exception")
+    if completion.get("result_replay_required") is not True:
+        raise MismatchError("llm-only replay has no recorded observation for this tool")
+    return _restore_tool_observation({}, completion.get("framework_result"))
+
+
 def _restore_tool_observation(native_result: Any, recorded_result: Any) -> Any:
     if not isinstance(native_result, dict) or not isinstance(recorded_result, dict):
         raise RuntimeError("mini-swe replay cannot restore a non-object tool observation")
@@ -361,6 +397,9 @@ def _docker_execute_factory(original):
                 result_contract=_TOOL_RESULT_CONTRACT,
                 semantic_timeout_s=semantic_timeout_s,
             )
+            simulated = reservation.get("simulated_execution")
+            if simulated is not None:
+                return _simulate_tool(boundary, reservation, simulated)
             native_children: list[dict[str, Any]] = []
             original_interpreter = None
             if os.environ.get("PIN_CPU_TOOL_AFFINITY") == "1":

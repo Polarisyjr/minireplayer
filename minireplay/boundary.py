@@ -121,9 +121,11 @@ class BoundaryLedger:
         bundle: Any | None = None,
         llm_index: Any | None = None,
         fast_claim: bool = False,
+        replay_mode: str = "full",
     ) -> None:
         require(mode in {"record", "replay"}, f"invalid boundary mode: {mode!r}")
         self.mode = mode
+        self.replay_mode = replay_mode
         self.stage_dir = stage_dir
         self.auth_token = auth_token
         self.adapter = adapter
@@ -537,6 +539,18 @@ class BoundaryLedger:
                     self._workspace_path(payload),
                 )
             response["execution_arguments"] = execution_arguments
+        if expected is not None and kind == "tool" and self.replay_mode == "llm-only":
+            # The tool is fixed work that this mode deliberately does not enter.
+            # The caller holds its lane for the duration the source observed and
+            # then completes with the recorded observation, so the LLM request
+            # arrival pattern stays the one the recording proved.
+            response["simulated_execution"] = {
+                "elapsed_ns": max(
+                    0,
+                    int(expected["ended_at_ns"]) - int(expected["started_at_ns"]),
+                ),
+                "status": str(expected.get("status", "ok")),
+            }
         return response
 
     def _resolve_trigger(self, payload: dict[str, Any]) -> dict[str, Any]:

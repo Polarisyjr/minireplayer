@@ -42,6 +42,7 @@ from .cutoff import close_stage_at_cutoff
 from .errors import InfrastructureError, MismatchError
 from .lane_record import materialize_lane_recording
 from .launcher import native_command, tmux_tmpdir
+from .llm_store import FORCED_REPLAY_MODES
 from .metrics import GPUSampler, RunMetrics, operation_summary, wait_until
 from .services import ReplayServices
 from .step3 import export_step3
@@ -105,6 +106,13 @@ class Supervisor:
         self.run_id = run_id
         self.bundle = bundle
         self.replay_mode = replay_mode
+        if mode == "replay" and replay_mode == "llm-only" and config.adapter != "mini-swe":
+            # Simulating a tool means not entering its native implementation, which
+            # every adapter has to opt into at its own execution point. Refuse the
+            # mode rather than silently running a full replay under its name.
+            raise InfrastructureError(
+                f"--mode llm-only is implemented for mini-swe only, not {config.adapter!r}"
+            )
         self.fast_claim = fast_claim
         self.force_secret, self.audit_path = self._forced_wiring()
 
@@ -128,16 +136,17 @@ class Supervisor:
         """
 
         if not self.config.serving:
-            if self.mode == "replay" and self.replay_mode == "full":
+            if self.mode == "replay" and self.replay_mode in FORCED_REPLAY_MODES:
                 raise InfrastructureError(
-                    "--mode full needs config.serving; start vLLM with `minireplay vllm-up`"
+                    f"--mode {self.replay_mode} needs config.serving; "
+                    "start vLLM with `minireplay vllm-up`"
                 )
             return None, None
         from .serving import ensure_secret
 
         spec = self.config.serving_spec()
         if not spec.audit_path_on_host.exists():
-            if self.mode == "replay" and self.replay_mode == "full":
+            if self.mode == "replay" and self.replay_mode in FORCED_REPLAY_MODES:
                 raise InfrastructureError(
                     f"forced-decoding audit file is missing: {spec.audit_path_on_host}. "
                     "Start vLLM with `minireplay vllm-up`."

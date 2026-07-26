@@ -229,7 +229,11 @@ def _run_labels(runs: list[dict[str, Any]]) -> list[str]:
     labels = ["Record"]
     for index, run in enumerate(runs[1:], 1):
         mode = run["metrics"].get("replay_mode")
-        prefix = "Full" if mode == "full" else "Tool-only" if mode == "tool-only" else "Replay"
+        prefix = {
+            "full": "Full",
+            "tool-only": "Tool-only",
+            "llm-only": "LLM-only",
+        }.get(str(mode), "Replay")
         labels.append(f"{prefix} replay {index}")
     return labels
 

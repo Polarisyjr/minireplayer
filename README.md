@@ -43,6 +43,15 @@ Not fixed (recorded as evidence, never compared):
   prefill, logits and sampling while committing the recorded tokens. Needs a fleet
   started by `minireplay vllm-up` and a bundle recorded against it; a run that asks
   for it otherwise fails rather than silently reporting GPU work it did not do.
+- `--mode llm-only` — the mirror of tool-only: the LLM lane runs against a real vLLM
+  exactly as in `full`, while each tool is held for the duration the source observed
+  and then answered from the bundle without entering its native implementation. The
+  wait is what keeps the engine's request arrival pattern comparable to a full
+  replay; returning at once would change its batching and cache pressure into a
+  different workload. Tool ledger records carry `native_execution: false`, so the
+  evidence stays explicit about what did not run, and a replay in this mode is not a
+  full replay for validity purposes. Implemented for mini-swe only; other frameworks
+  refuse the mode rather than silently running a full replay under its name.
 
 ## Workflow
 

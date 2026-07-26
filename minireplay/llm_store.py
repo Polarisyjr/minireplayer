@@ -46,7 +46,11 @@ from .util import append_jsonl, monotonic_ns, require, sha256_json
 # but never compared, and the recorded values are what the framework receives.
 _TOKEN_FIELDS = ("prompt_token_ids", "token_ids", "raw_message_tokens")
 
-REPLAY_MODES = ("tool-only", "full")
+REPLAY_MODES = ("tool-only", "full", "llm-only")
+# Modes that make the engine genuinely execute the recorded request. ``llm-only``
+# differs from ``full`` only on the tool lane, which it simulates instead of
+# entering natively.
+FORCED_REPLAY_MODES = frozenset({"full", "llm-only"})
 
 
 @dataclass(frozen=True)
@@ -726,7 +730,7 @@ class LLMStore:
         expected: dict[str, Any],
     ) -> web.StreamResponse:
         started = monotonic_ns()
-        if self.replay_mode == "full":
+        if self.replay_mode in FORCED_REPLAY_MODES:
             await self._run_upstream(identity, api, expected)
         self._index_model_calls(str(expected["attempt_id"]), expected["response"])
         self._write_replay_attempt(expected, identity, started, monotonic_ns())

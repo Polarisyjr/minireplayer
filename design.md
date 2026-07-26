@@ -101,6 +101,13 @@ replay 必须进入该父 task，重建 child session，消费 source 中已经�
 LLM/dispatch/tool，然后永久扣住父 task completion；source 未完成的 child tail 不领取，
 父 result 不伪造。这既保留成功执行的子工作，也不会允许 source 中不存在的后续 refill。
 
+`llm-only` 是 `tool-only` 的镜像模式：LLM lane 与 `full` 完全一致地打真实 vLLM，
+而每个 tool 不进入 native implementation，只按 source 观察到的时长占住该 lane，然后返回
+bundle 里录制的 observation。占时长是必需的——立即返回会改变 engine 看到的请求到达模式、
+batching 和 cache 压力，测的就是另一个 workload。该模式下 tool ledger 记 `native_execution:
+false`，它不满足"每个顶层 tool 真实进入 native implementation"，因此不能当作 full replay
+的有效性结论使用。当前只对 mini-swe 实现；其他 framework 直接拒绝该模式。
+
 Replay 使用 sweep 的相同 launcher、task order、并发和 refill。它在全部闭合 slots 完成后
 结束；普通 `truncated` 尾段只说明 source 在哪里被切断。复合 task tail 只领取父入场与
 source 已观察到的 elapsed window，不产生 parent completion。录制后检查 timeline，不应出现

@@ -69,6 +69,7 @@ class ReplayServices:
             bundle=bundle,
             llm_index=self.llm,
             fast_claim=fast_claim,
+            replay_mode=replay_mode,
         )
         tail_actors = {
             str(entry["actor_id"])
