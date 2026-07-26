@@ -17,11 +17,19 @@ order 补入下一个任务，`false` 时只运行 seeded order 的前 C 个任�
 
 coral是跑frointer-cs-algo这个数据集
 
+CORAL 的 C 不能解释为扁平 agent 数。它单独维护 C 个 team/task slot；每个 slot 同时拥有
+固定 4 条 OpenCode agent 子 lane，因此 C8 的目标窗口是 8 个 team、32 条 agent lane。
+CORAL refill 的原子单位是整个 team：只有某个 task 的 4-agent 进程组全部结束并完成清理后，
+该 team slot 才能进入下一代 task；禁止按单 agent 补位。录制必须保存
+`team_slot / slot_generation / parent team / agent-1..4` 层级，bundle 必须拒绝不完整 team。
+
 如有必要可以复用已有代码简单wrap新的启动器。不得另造 task list、queue、prompt、scheduler、completion condition 或 workload override。
 
 如果使用sweep规范，C1 是 seeded order 的第一个任务。C8 是同一 order 的前八个任务按 sweep 语义并发，不是八条 C1 的拼接。任务在 cutoff 时未完成是正常实验结果，不得换任务或要求自然完成。
 
-开发 smoke 可以通过同一 sweep 的原生 `--duration` 参数缩短窗口；正式 bundle 的窗口固定为 1200 秒。
+开发 smoke 可以通过同一 sweep 的原生 `--duration` 参数缩短窗口；正式默认是先 warmup 15 秒，
+再录制 180 秒。CORAL 默认每个 invocation 最多 100 个 model turn、team 全局最多 10 个
+invocation，并允许 exited agent 重启；这三个参数都属于 workload identity。
 
 Sweep 脚本和 framework checkout 必须已经具备本地模型、dataset、image 与依赖。
 Replayer 不下载、不替换，也不自造 workload。
@@ -34,7 +42,12 @@ Bundle 保存：
 - source 窗口内已经闭合的 LLM、dispatch、tool 和 grader causal slots；
 - 原始 LLM request、prompt token、committed output token 和 response/chunks；
 - 顶层 tool 参数、实际 native outcome，以及返回给 framework 的 observation；
-- source cutoff 时仍 active 的 operation，保存为 `truncated` 诊断证据，包括原始请求、native implementation 和从 operation start 到 cutoff 的已执行时长；它不属于 replay workload。
+- source cutoff 时仍 active 的 operation，保存为 `truncated` 边界证据，包括原始请求、
+  native implementation 和从 operation start 到 cutoff 的已执行时长；
+- 已经闭合的 LLM 独立成立：它吐出 tool-call 后尚未进入 dispatch 就被杀时，保留 LLM，
+  记录零时长 `pre_dispatch` 边界，并且不存在 tool；
+- CORAL 内置 `task` 是复合 subagent 父调用。父 task 在 cutoff 时未完成，不得删除它下面
+  已经闭合的 child LLM/dispatch/tool；未完成的 child 只作为 tail。
 - 使用类似step3的渲染方法补出timeline
 
 Bundle 的物理布局按 actor causal lane 分片：每个 lane 独立保存其 LLM、dispatch、tool、
@@ -78,13 +91,36 @@ Record 热路径中每个 actor/session 直接追加自己的 start/complete 事
 dispatch `/start` 服务。LLM proxy 与 replay boundary 分属独立 event loop；一个 lane 的同步
 请求、落盘或工具耗时不得阻塞其他 lane。录制结束后再离线物化和校验 canonical ledger。
 
-Source 完整执行 sweep，`sample_end` 是录制边界。边界时间由 sweep 事件冻结。已经完成的task 全部保留，framework 按原生 sweep 继续 refill。边界时仍 active 的 LLM、dispatch、tool
-或 grader 不伪造成完成，也不整段丢弃，而是保存为 `cutoff_truncated` 诊断证据。Replay 只消费
-cutoff 前已经闭合的因果前缀，在每条 live lane 的第一个 tail 进入 LLM 或 native implementation
-之前停止，不向 framework 伪造 output，也不允许 refill 出 source 中不存在的后续 task。
+Source 完整执行 sweep，`sample_end` 是录制边界。边界时间由 sweep 事件冻结。已经完成的
+task 全部保留，framework 按原生 sweep 继续 refill。边界时仍 active 的 LLM、dispatch、tool
+或 grader 不伪造成完成，也不整段丢弃，而是保存为 `cutoff_truncated` 边界证据。
+
+Replay 消费 cutoff 前已经闭合的因果前缀。普通 tail 和 `pre_dispatch` tail 都在 LLM 或
+native implementation 入场前停止。唯一的入场例外是仍 active 的复合 CORAL `task`：
+replay 必须进入该父 task，重建 child session，消费 source 中已经闭合的 child
+LLM/dispatch/tool，然后永久扣住父 task completion；source 未完成的 child tail 不领取，
+父 result 不伪造。这既保留成功执行的子工作，也不会允许 source 中不存在的后续 refill。
 
 Replay 使用 sweep 的相同 launcher、task order、并发和 refill。它在全部闭合 slots 完成后
-结束；`truncated` 尾段只用于说明 source 在哪里被切断，不参与领取或完成判断。录制后检查timeline，不应出现明显无法归因的空白。如果 sweep 自身先到cutoff、出现未知 slot、缺少 slot 或控制流分叉，run 无效。
+结束；普通 `truncated` 尾段只说明 source 在哪里被切断。复合 task tail 只领取父入场与
+source 已观察到的 elapsed window，不产生 parent completion。录制后检查 timeline，不应出现
+明显无法归因的空白。如果 sweep 自身先到 cutoff、出现未知 slot、缺少 slot 或控制流分叉，
+run 无效。
+
+CORAL 的并发遥测和 timeline 以 team slot 分组：每代 team 下恰好四条 agent lane。图中的
+32 条 agent lane 不能被误报为 C32；它们是 C8 的 `8 × 4` 孙 lane。开启 refill 时，新一代
+仍画在其 team slot 分组内，并在前一代四条 lane 全部退出后开始。CORAL manager 可能先于
+180s sample window 因 global turn budget 杀掉 team；这个 team cutoff 必须以 manager
+发布的 epoch 时间投影到同组全部四条 lane。未完成 LLM/tool tail 只画到这个更早的时间，
+无 active work 的 lane 也必须显示 termination marker；marker 之后是“不可能再有 work”的
+终止区，不是 cutoff operation，也不计入 busy/coverage。
+
+同一 team generation 内，单条 agent lane 可以经历多次 OpenCode invocation。Restart 是
+原生控制流边界，不是 replayable tool：Step3 从 CORAL invocation log 单独画 restart
+window，且不计入 work busy。Record 给每次 runtime start 分配单调 invocation index，并把
+它写入 root/child session identity；full replay 仍由 CORAL manager 原生 restart，但只有
+相同 invocation generation 才能消费对应的 LLM/tool。这样既保留 restart/resume 造成的
+真实间隔，也禁止把多个进程的事件静默展平成一个持续会话。
 
 Record 和 full replay 在 actor gate 前执行同一套 serving warmup。顺序固定为
 `reset prefix/KV -> warmup -> reset prefix/KV -> open gate`，从而排除首个 measured LLM 的
@@ -102,7 +138,9 @@ Replay 必须满足：
 - prompt 与 committed token 一致；
 - 每个顶层 tool 真实进入 native implementation；
 - 向 framework 回灌的 observation 与 bundle 一致；
-- cutoff 尾段均未进入 LLM 或 native implementation，且没有产生额外 refill；
+- 普通 cutoff / `pre_dispatch` 尾段未进入 LLM 或 native implementation；
+- 复合 task tail 只允许父 task 入场，其闭合 child slots 恰好消费、父 result 未返回，
+  未完成 child tail 未领取，且没有产生额外 refill；
 - 无未知调用、instrumentation failure、vLLM 泄漏或 run-owned 资源残留。
 
 报告 replay 的 makespan、CPU、GPU、I/O、网络、operation timing 和实际 tool outcome。

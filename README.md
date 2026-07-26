@@ -13,9 +13,12 @@ sweep closes, those lane logs are materialized into the validated ledgers and pa
 as `bundle/lanes/*/events.jsonl`; the bundle root is only a run manifest and terminal
 summary. Replay still validates each lane's next slot before native work starts.
 
-Calls still active at source cutoff are retained as diagnostic tail evidence, but
-they are not replay slots. Replay consumes the closed causal prefix and stops before
-entering the first truncated LLM or native operation on each live lane.
+Calls still active at source cutoff are retained as tail evidence. Ordinary tails
+stop replay before native entry. A composite CORAL `task` tail is different: replay
+enters the parent task so its already-completed subagent LLM/tools can run, then
+withholds the unfinished parent result. An LLM response that completed before tool
+dispatch is also retained; its tool call gets an explicit zero-duration
+`pre_dispatch` marker and no tool record.
 
 ## What is fixed, and what is not
 
@@ -51,7 +54,7 @@ cat > run.json <<'JSON'
   "repo": "/mnt/raid0/Jirong/HPCA/multiagent",
   "concurrency": 1,
   "refill": true,
-  "duration_s": 60,
+  "duration_s": 180,
   "seed": 42,
   "targets": {"vllm-8000": "http://127.0.0.1:8000"},
   "gpu_ids": [0]
@@ -73,16 +76,33 @@ go through the sweep's `-s` interface: every successful recording exports its
 captured LLM/tool lanes (with cutoff tails marked as source-only diagnostics) to
 `source-run/step3/raw/` and
 renders `source-run/step3/views/timeline.{png,txt}` automatically.
+For CORAL, manager-driven team termination is also exported as
+`lane_terminations.jsonl` and marked on all four child lanes independently of the
+later recording-window boundary. The post-termination hatch denotes no possible
+lane work and is excluded from timeline coverage.
+Native CORAL invocation transitions are exported separately as
+`restart_events.jsonl`. They remain manager-driven control intervals rather than
+replayed tools; invocation-scoped session identities ensure that later fixed
+LLM/tool work cannot be consumed by the wrong pre-restart process.
 
 Recording and full replay use the configured serving warmup before the actor gate.
 The native sweep resets the prefix/KV cache before warmup and again after warmup,
 so compilation and sampler startup are excluded without carrying warmup prompts
-into the measured causal lanes. Tool-only replay sends no serving traffic.
+into the measured causal lanes. The formal default is a 15-second warmup followed
+by a 180-second source window. Tool-only replay sends no serving traffic.
 
 `refill` has the same meaning for every framework. When true, a completed task is
 replaced with the next task in seeded order while the native pool has work. When
 false, only the first `concurrency` tasks run and concurrency decays as they finish.
 Because this changes the workload, it is part of bundle identity.
+
+CORAL has a grouped concurrency window: `concurrency` counts four-agent teams, not
+individual OpenCode processes. C8 therefore means 8 team slots and 32 agent lanes.
+A refill replaces one complete four-agent team after that team has exited and been
+cleaned up; it never fills individual agent positions. New bundles preserve this as
+`concurrency_window` with team slot, generation, parent, and four child lane IDs.
+CORAL defaults to 100 model turns per invocation, 10 invocations across the team,
+and `restart_exited=true`; all three remain explicit workload-identity fields.
 
 `report` compares repeated replays and flags metrics whose spread is worth a look. It
 does not fail a run for being slow, and it does not attribute variance automatically
